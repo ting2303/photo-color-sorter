@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+*.spec
+*.zip
+.venv/
+venv/
+
+# 不要上傳照片與個人紀錄
+*.jpg
+*.JPG
+*.jpeg
+*.png
+*.tif
+*.tiff
+*.cr2
+*.cr3
+*.nef
+*.arw
+*.raf
+*.dng
+*.xmp
+_色彩分類紀錄_*.csv
+_色彩改名紀錄_*.csv
+!docs/images/*.png
