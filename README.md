@@ -1,125 +1,145 @@
-# 舞台照片色彩分類工具 Photo Color Sorter
+# 舞台照片色彩分類工具
 
-自動判斷舞台照片中 **「臉被照成什麼顏色」** 與 **「整張照片的主要顏色」**，一鍵**改檔名**或**分資料夾**。匯入 Lightroom Classic 後用檔名排序，照片就會依燈光顏色排好，修圖更快。
+**中文** | [English](README.en.md)
+
+拍舞台和演唱會時，燈光每隔幾秒就換一次顏色。回家修圖面對幾百張照片，最花時間的往往不是調色本身，而是先把「同一種燈光」的照片找出來。
+
+這個工具會替你看每張照片：**臉被打成什麼顏色的光**，以及**整個畫面的主色**，然後把結果寫進檔名，或把照片分到對應的資料夾。匯入 Lightroom Classic 後依檔名排序，同樣燈光的照片就會排在一起，調好一張就能同步給整組。
 
 ![判斷範例](docs/images/examples.jpg)
-<sub>實際判斷結果。框線是偵測到的臉（已打馬賽克保護隱私），下方是「臉的顏色／整體主色」和產生的檔名前綴。</sub>
 
-- ✅ **簡單好用**：下載程式（約 60 MB）、解壓縮、雙擊開啟，不用另外裝 Python（Windows 10／11）
-- ✅ **完全離線**：不連網路、不上傳照片
-- ✅ **不會弄壞照片**：只改名或搬移，不修改內容、不刪檔，隨時可一鍵復原
-- ✅ **支援 RAW**：Canon、Nikon、Sony、Fujifilm 等主流 RAW，RAW + JPG + XMP 同名檔一起處理
+<sub>實際判斷結果（人臉已打馬賽克）。框線是偵測到的臉，底下依序是臉的顏色、整體主色，以及寫進檔名的前綴。</sub>
 
-📘 **[下載圖文使用教學 PDF](docs/使用教學.pdf)**
+## 下載
 
-⭐ 覺得好用的話，請幫忙按右上角的 **Star**，讓更多攝影師看到！
+到 [Releases](../../releases/latest) 下載 `PhotoColorSorter-Windows.zip`（約 60 MB），解壓縮後執行 `PhotoColorSorter.exe`。
 
-> 🆓 **個人與非營利使用免費**｜🚫 **禁止商業用途**（詳見[授權](#授權與免責聲明)）
+- 系統需求：Windows 10 或 11，不需要另外安裝 Python
+- 第一次開啟時，Windows 可能顯示「已保護您的電腦」。這是因為程式沒有購買數位簽章，點「其他資訊」→「仍要執行」即可。若想確認檔案沒被改過，可以比對 Release 頁面上的 SHA-256（做法見 [SECURITY.md](SECURITY.md)）。
+- 圖文教學：[使用教學.pdf](docs/使用教學.pdf)（3 頁，ZIP 裡也有一份）
 
----
+## 使用方式
 
-## 快速開始
+> **請在匯入 Lightroom 之前使用，並先備份原始照片。** 照片匯入後若在外部改名，Lightroom 會找不到檔案。
 
-### 方法一：直接下載程式（推薦）
-1. 到右側 **[Releases](../../releases/latest)** 下載 `PhotoColorSorter-Windows.zip`
-2. 右鍵 →「解壓縮全部」
-3. 雙擊 `PhotoColorSorter.exe`
-   - 若出現「Windows 已保護您的電腦」→ 點「其他資訊」→「仍要執行」（原因見 [SECURITY.md](SECURITY.md)）
+1. 選擇照片資料夾
+2. 按「① 分析」。這一步只會讀取照片，不會更動任何檔案
+3. 在表格裡確認結果。切換上方選項時，最右欄會即時更新，不必重新分析
+4. 按「② 執行」
+5. 如果不滿意，按「復原上一次」就會恢復原狀
 
-> 💡 也可以直接把照片資料夾**拖到 `PhotoColorSorter.exe` 上**，程式會自動開啟並開始分析。
+也可以直接把資料夾拖到 `PhotoColorSorter.exe` 的圖示上，程式開啟後會自動開始分析。
 
-### 方法二：從原始碼執行（進階）
+![程式畫面](docs/images/screenshot-rename.png)
+
+### 輸出方式
+
+| 方式 | 處理前 | 處理後 |
+|---|---|---|
+| 改檔名 | `DSC_1234.JPG` | `8粉6藍_DSC_1234.JPG` |
+| 分資料夾 | `DSC_1234.JPG` | `膚色8粉\整體6藍\DSC_1234.JPG` |
+
+以 `8粉6藍_` 為例：前半 `8粉` 是臉的顏色，後半 `6藍` 是整體主色。
+
+### 顏色代碼
+
+| 代碼 | 意思 |
+|---|---|
+| `0白` | 白光；若出現在臉的位置，代表膚色正常、沒被有色光染到 |
+| `1紅` `2橙` `3黃` `4綠` `5青` `6藍` `7紫` `8粉` | 被該顏色的燈光照到 |
+| `9暗` | 畫面或臉部太暗，無法判斷 |
+| `無` | 沒偵測到臉（背對鏡頭、臉太小或太暗），只會出現在臉的位置 |
+
+數字只用來排序。Lightroom 依檔名排列時會照 0 → 9 的順序，大致就是白光在前、接著依彩虹色排列，「無」排在最後。
+
+### 選項
+
+| 選項 | 說明 |
+|---|---|
+| 依據 | 同時看臉和整體，或只看其中一項 |
+| 優先 | 決定臉或整體放在前面，也就是排序時先依哪一項分組 |
+| 加排序數字 | 取消勾選後檔名更短（例如 `粉藍_`），同色照片仍會排在一起，只是不照彩虹順序 |
+| 包含子資料夾 | 連子資料夾一起處理，已經分好的顏色資料夾會自動略過 |
+
+### 在 Lightroom Classic 裡排序
+
+在「圖庫」模組按 `G` 切到格線檢視，下方工具列的「排序方式」選「檔案名稱」。
+
+只想處理某一種光時，可以用「圖庫過濾器 → 文字 → 檔案名稱」輸入例如 `6藍`，調好其中一張再同步到其他照片。
+
+## 判斷方式
+
+- **人臉偵測**：使用 OpenCV 的 [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) 模型找出臉的位置。偵測時不看顏色，所以不會被燈光干擾，遠處的小臉也抓得到。它只判斷「哪裡有臉」，不會辨識是誰。
+- **臉的顏色**：統計每張臉中央區域的色相，取佔比最高的顏色。臉越大、偵測越確定，影響越大。
+- **整體主色**：略過黑暗的部分，以亮處的有色光為主統計。
+
+這是自動判斷，難免有誤，例如背景圖案被當成臉，或偏冷的白光被判成藍色。判斷的靈敏度可以在 `photo_color_sorter.py` 開頭調整。
+
+## 常見問題
+
+**會不會弄壞照片？**
+不會。程式只改檔名或搬移檔案，不修改照片內容，也不刪除任何檔案。每次執行都會留下紀錄，可以完整復原。
+
+**照片會被上傳嗎？**
+不會。所有處理都在你的電腦上完成，程式不連網路。
+
+**支援哪些格式？**
+JPG、PNG、TIFF，以及 Canon、Nikon、Sony、Fujifilm 等主流相機的 RAW 檔。同名的 RAW、JPG、XMP 會一起處理。
+
+**照片放在網路磁碟上很慢？**
+先複製到本機硬碟再分析會比較快。作為參考，825 張 JPG 放在網路磁碟上，分析大約花 2 分鐘。
+
+**有 Mac 版嗎？**
+目前只有 Windows 版。
+
+<details>
+<summary><b>從原始碼執行、命令列與開發</b></summary>
+
 需要 Python 3.10 以上：
+
 ```bash
 pip install -r requirements.txt
 python photo_color_sorter.py
 ```
 
----
+命令列用法：
 
-## 使用方式
-
-> ⚠️ **請在匯入 Lightroom 之前執行，並先備份原始照片。** 已匯入的照片在外部改名，Lightroom 會找不到檔案。
-
-1. **選擇**照片資料夾
-2. 按 **① 分析**：只預覽，不動任何檔案
-3. 切換上方選項檢查結果（不需重新分析）
-4. 按 **② 執行**
-5. 不滿意可按 **復原上一次**
-
-![主畫面](docs/images/screenshot-rename.png)
-
-### 兩種輸出方式
-
-| 輸出方式 | 結果範例 |
-|---|---|
-| 改檔名 | `DSC_1234.JPG` → `8粉6藍_DSC_1234.JPG`（前＝臉、後＝整體） |
-| 分資料夾 | `DSC_1234.JPG` → `膚色8粉\整體6藍\DSC_1234.JPG` |
-
-### 顏色代碼
-數字決定排列順序（彩虹順序）：
-
-| 0白 | 1紅 | 2橙 | 3黃 | 4綠 | 5青 | 6藍 | 7紫 | 8粉 | 9暗 | 無 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 白光／自然膚色 | | | | | | | | | 太暗 | 沒偵測到臉 |
-
-### 在 Lightroom Classic 依顏色排列
-圖庫模組 → 格線檢視（`G`）→ 下方工具列「排序方式」選 **檔案名稱**。
-也可以用「圖庫過濾器 → 文字 → 檔案名稱」輸入 `6藍`，只看臉被藍光照到的照片，一次套用同一組調色。
-
-### 選項說明
-| 選項 | 說明 |
-|---|---|
-| 依據 | 膚色＋整體／只看膚色／只看整體 |
-| 優先 | 膚色或整體放前面（決定排序先依哪一項） |
-| 加排序數字 | 不勾選時檔名更短（`粉藍_`），同色仍會排在一起 |
-| 包含子資料夾 | 一併處理子資料夾（會自動略過本工具建立的顏色資料夾） |
-
----
-
-## 運作原理
-- **人臉偵測**：使用 OpenCV 的 [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) 深度學習模型找出人臉位置（只判斷「哪裡有臉」，**不辨識是誰**）。不受燈光顏色影響，遠景小臉也能偵測。
-- **膚色判斷**：取每張臉中央區域的像素，統計色相，以最多數的顏色為準；臉越大、信心越高權重越大。
-- **整體主色**：忽略黑暗區域，以明亮的有色光為主統計色相。
-
-判斷靈敏度可在 `photo_color_sorter.py` 開頭調整（`FACE_SCORE`、`SKIN_NATURAL_S`、`NEUTRAL_S`）。
-
-## 命令列（選用）
 ```bash
 python photo_color_sorter.py "D:\照片\活動" --preview                  # 預覽改檔名
 python photo_color_sorter.py "D:\照片\活動" --preview --output folder  # 預覽分資料夾
 python photo_color_sorter.py "D:\照片\活動" --apply                    # 實際執行
 ```
+
 其他參數：`--mode both|skin|main`、`--order skin|main`、`--no-digits`、`-r`（含子資料夾）
 
-## 開發
+開發：
+
 ```bash
 python -m unittest discover tests   # 執行測試
-build_exe.bat                       # 打包成 exe（輸出到 dist\PhotoColorSorter）
+build_exe.bat                       # 打包成 exe，輸出到 dist\PhotoColorSorter
 python docs\build_tutorial.py       # 重新產生教學 PDF
 ```
 
+</details>
+
 ## 安全性
-所有改名與復原都限制在所選資料夾內、不覆蓋既有檔案、紀錄檔防竄改、模型檔有 SHA-256 驗證。詳見 [SECURITY.md](SECURITY.md)。發現漏洞請用 GitHub 的 **Security → Report a vulnerability** 私下回報。
 
-## 授權與免責聲明
-本專案採用 **[PolyForm Noncommercial License 1.0.0](LICENSE)**，版權所有 © 2026 ting2303。
+改名和復原都只會發生在你選的資料夾內，不會覆蓋既有檔案；復原紀錄若被改過、指向資料夾以外的位置，程式會拒絕執行。細節見 [SECURITY.md](SECURITY.md)。如果發現安全問題，請透過本頁的 **Security → Report a vulnerability** 私下回報。
 
-| 可以 ✅ | 不可以 ❌ |
+## 授權
+
+本專案採用 [PolyForm Noncommercial License 1.0.0](LICENSE)，© 2026 ting2303。
+
+| 允許 | 不允許 |
 |---|---|
-| 個人免費使用（包含整理自己拍的照片） | 販售本工具或其修改版本 |
-| 學生、社團、學校、非營利組織使用 | 將本工具放進付費產品或付費服務 |
-| 閱讀、修改原始碼，非商業分享 | 移除作者版權聲明（`Required Notice`） |
+| 個人使用，包括整理自己接案拍的照片 | 販售本工具或修改後的版本 |
+| 學校、社團、非營利組織使用 | 把本工具放進付費產品或服務 |
+| 閱讀、修改原始碼並以非商業方式分享 | 移除 LICENSE 中的作者聲明 |
 
-- 分享或修改時，必須保留 LICENSE 檔案與作者聲明
-- **商業授權**請透過 GitHub 聯絡 [ting2303](https://github.com/ting2303)
-- 使用前請詳閱 **[免責聲明 DISCLAIMER.md](DISCLAIMER.md)**：本工具依現狀提供，不提供任何擔保；因使用造成的任何損失，作者概不負責
-- 第三方元件授權見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-- Adobe、Lightroom 為 Adobe Inc. 的商標，本專案與 Adobe 無關
+需要商業授權，請透過 GitHub 聯絡 [ting2303](https://github.com/ting2303)。
+
+使用前請先閱讀[免責聲明](DISCLAIMER.md)。第三方元件的授權見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。Adobe 與 Lightroom 是 Adobe Inc. 的商標，本專案與 Adobe 無關。
 
 ---
 
-## English
-**Photo Color Sorter** analyzes stage/concert photos and detects (1) the color of the light falling on performers' faces and (2) the dominant color of the whole image, then renames files with a sortable color prefix or sorts them into color folders — so Lightroom Classic can sort by filename and group shots by lighting. Runs fully offline on Windows; just download the ~60 MB app, unzip and run — no Python setup needed (download from [Releases](../../releases/latest)). Files are only renamed or moved, never modified or deleted, and every run can be undone.
-
-**License:** [PolyForm Noncommercial 1.0.0](LICENSE) — free for personal and noncommercial use; **commercial use is not permitted** without a separate license from the author (contact [ting2303](https://github.com/ting2303)). Please read [DISCLAIMER.md](DISCLAIMER.md) before use. If you find it useful, a ⭐ is appreciated!
+如果這個工具幫你省了一些時間，歡迎在頁面右上角按個 Star，或到 [Issues](../../issues) 告訴我哪裡可以改進。
