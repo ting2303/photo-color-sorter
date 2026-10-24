@@ -2,6 +2,9 @@
 """
 舞台照片色彩分類工具 Photo Color Sorter
 
+Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-color-sorter)
+授權：PolyForm Noncommercial License 1.0.0（僅限非商業用途），詳見 LICENSE
+
 功能：
   1. 偵測人臉，判斷「膚色被照成什麼顏色」（取臉部像素中佔最多數的色相）
   2. 判斷「整張照片的主要顏色」（忽略黑暗區域，以亮的有色光為主）
@@ -35,7 +38,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.0.0'
+__version__ = '1.0.1'
 
 try:
     import rawpy
@@ -477,7 +480,7 @@ def run_gui(initial_folder=None):
     except Exception:
         pass
     root = tk.Tk()
-    root.title('舞台照片色彩分類工具 v%s' % __version__)
+    root.title('舞台照片色彩分類工具 v%s　© 2026 ting2303・僅限非商業用途' % __version__)
     root.geometry('1150x700')
 
     folder = tk.StringVar()

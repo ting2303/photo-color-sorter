@@ -99,7 +99,7 @@ def build(out):
            P('Photo Color Sorter　v%s　使用教學' % __version__, 'subtitle'), Spacer(1, 14),
            P('自動判斷「臉被照成什麼顏色」與「整張照片的主色」<br/>一鍵改檔名或分資料夾，匯入 Lightroom 就依顏色排好', 'subtitle'),
            Spacer(1, 70 * mm),
-           P('免費開源（MIT 授權）・完全離線執行・不上傳任何照片', 'subtitle'), PageBreak()]
+           P('個人與非營利使用免費・禁止商業用途・完全離線執行<br/>© 2026 ting2303　github.com/ting2303/photo-color-sorter', 'subtitle'), PageBreak()]
 
     # ---- 1 功能介紹
     st += [P('1　這個工具能做什麼', 'h1'),
@@ -205,11 +205,13 @@ def build(out):
            P('3. 顏色與人臉判斷為自動演算法產生，可能有誤，僅供整理參考。'),
            P('4. 本工具只偵測「哪裡有臉」以取樣顏色，<b>不辨識人物身分</b>，也不儲存任何人臉資料。照片中人物的肖像權與個資保護由使用者自行負責。'),
            P('5. Adobe、Lightroom 為 Adobe Inc. 的商標。本工具為獨立開發，與 Adobe Inc. 無任何關聯。'),
-           P('6. 完整條款請見專案中的 DISCLAIMER.md 與 LICENSE（MIT 授權）；第三方元件授權見 THIRD_PARTY_NOTICES.md。'),
+           P('6. 本工具採用 PolyForm Noncommercial License 1.0.0（版權所有 © 2026 ting2303），<b>僅限個人及非商業用途</b>，'
+             '禁止販售或用於商業產品、服務；商業授權請另行聯絡作者。'),
+           P('7. 完整條款請見 LICENSE 與 DISCLAIMER.md；第三方元件授權見 THIRD_PARTY_NOTICES.md。'),
            ]
 
     doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=20 * mm, rightMargin=20 * mm, topMargin=18 * mm, bottomMargin=20 * mm,
-                            title='舞台照片色彩分類工具 使用教學', author='photo-color-sorter contributors',
+                            title='舞台照片色彩分類工具 使用教學', author='ting2303',
                             subject='Photo Color Sorter v%s 使用教學' % __version__)
     doc.build(st, onLaterPages=footer)
 

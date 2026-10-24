@@ -11,6 +11,10 @@
 
 📘 **[下載圖文使用教學 PDF](docs/使用教學.pdf)**
 
+⭐ 覺得好用的話，請幫忙按右上角的 **Star**，讓更多攝影師看到！
+
+> 🆓 **個人與非營利使用免費**｜🚫 **禁止商業用途**（詳見[授權](#授權與免責聲明)）
+
 ---
 
 ## 快速開始
@@ -96,7 +100,16 @@ python docs\build_tutorial.py       # 重新產生教學 PDF
 所有改名與復原都限制在所選資料夾內、不覆蓋既有檔案、紀錄檔防竄改、模型檔有 SHA-256 驗證。詳見 [SECURITY.md](SECURITY.md)。發現漏洞請用 GitHub 的 **Security → Report a vulnerability** 私下回報。
 
 ## 授權與免責聲明
-- 本專案以 [MIT 授權](LICENSE) 釋出
+本專案採用 **[PolyForm Noncommercial License 1.0.0](LICENSE)**，版權所有 © 2026 ting2303。
+
+| 可以 ✅ | 不可以 ❌ |
+|---|---|
+| 個人免費使用（包含整理自己拍的照片） | 販售本工具或其修改版本 |
+| 學生、社團、學校、非營利組織使用 | 將本工具放進付費產品或付費服務 |
+| 閱讀、修改原始碼，非商業分享 | 移除作者版權聲明（`Required Notice`） |
+
+- 分享或修改時，必須保留 LICENSE 檔案與作者聲明
+- **商業授權**請透過 GitHub 聯絡 [ting2303](https://github.com/ting2303)
 - 使用前請詳閱 **[免責聲明 DISCLAIMER.md](DISCLAIMER.md)**：本工具依現狀提供，不提供任何擔保；因使用造成的任何損失，作者概不負責
 - 第三方元件授權見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 - Adobe、Lightroom 為 Adobe Inc. 的商標，本專案與 Adobe 無關
@@ -104,4 +117,6 @@ python docs\build_tutorial.py       # 重新產生教學 PDF
 ---
 
 ## English
-**Photo Color Sorter** analyzes stage/concert photos and detects (1) the color of the light falling on performers' faces and (2) the dominant color of the whole image, then renames files with a sortable color prefix or sorts them into color folders — so Lightroom Classic can sort by filename and group shots by lighting. Runs fully offline on Windows; no installation required (download from [Releases](../../releases/latest)). Files are only renamed or moved, never modified or deleted, and every run can be undone. MIT licensed — see [DISCLAIMER.md](DISCLAIMER.md) before use.
+**Photo Color Sorter** analyzes stage/concert photos and detects (1) the color of the light falling on performers' faces and (2) the dominant color of the whole image, then renames files with a sortable color prefix or sorts them into color folders — so Lightroom Classic can sort by filename and group shots by lighting. Runs fully offline on Windows; no installation required (download from [Releases](../../releases/latest)). Files are only renamed or moved, never modified or deleted, and every run can be undone.
+
+**License:** [PolyForm Noncommercial 1.0.0](LICENSE) — free for personal and noncommercial use; **commercial use is not permitted** without a separate license from the author (contact [ting2303](https://github.com/ting2303)). Please read [DISCLAIMER.md](DISCLAIMER.md) before use. If you find it useful, a ⭐ is appreciated!

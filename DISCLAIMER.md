@@ -24,10 +24,13 @@ Adobe、Lightroom 為 Adobe Inc. 的商標。本工具為獨立開發，與 Adob
 ## 六、第三方元件
 本工具使用的第三方元件（OpenCV、NumPy、rawpy／LibRaw、YuNet 人臉模型等）依其各自授權條款提供，詳見 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 七、條款變更
+## 七、使用授權
+本工具採用 [PolyForm Noncommercial License 1.0.0](LICENSE)，版權所有 © 2026 ting2303。**僅限個人及非商業用途使用**，禁止販售或用於商業產品、服務；商業授權請另行聯絡作者。本聲明與授權條款如有不一致，以 LICENSE 為準。
+
+## 八、條款變更
 本聲明可能隨版本更新而修改，以 GitHub 儲存庫中最新版本為準。
 
 ---
 
 ## English Summary
-This software is provided **"AS IS", without warranty of any kind**. It renames or moves photo files; **always back up your originals before use**. The authors are not liable for any data loss, broken Lightroom catalog links, or other damages. Color and face detection are automatic and may be wrong. All processing happens **offline on your computer**; no photos or data are uploaded, and no face *recognition* (identifying people) is performed. Users are responsible for complying with portrait-rights and privacy laws. Adobe and Lightroom are trademarks of Adobe Inc.; this project is not affiliated with or endorsed by Adobe. See [LICENSE](LICENSE) (MIT) for full terms.
+This software is provided **"AS IS", without warranty of any kind**. It renames or moves photo files; **always back up your originals before use**. The authors are not liable for any data loss, broken Lightroom catalog links, or other damages. Color and face detection are automatic and may be wrong. All processing happens **offline on your computer**; no photos or data are uploaded, and no face *recognition* (identifying people) is performed. Users are responsible for complying with portrait-rights and privacy laws. Adobe and Lightroom are trademarks of Adobe Inc.; this project is not affiliated with or endorsed by Adobe. Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) (Copyright © 2026 ting2303): **noncommercial use only**; contact the author for commercial licensing.
