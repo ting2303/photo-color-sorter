@@ -12,7 +12,11 @@
 
 ## 下載
 
-到 [Releases](../../releases/latest) 下載 `PhotoColorSorter-Windows.zip`（約 60 MB），解壓縮後執行 `PhotoColorSorter.exe`。
+### [⬇ 下載 PhotoColorSorter-Windows.zip（約 60 MB）](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
+
+下載後在 ZIP 上按右鍵 →「解壓縮全部」，再執行資料夾裡的 `PhotoColorSorter.exe`。
+
+> 請用上面的連結，或到 [Releases](../../releases/latest) 頁面下載。頁面上方綠色的「Code → Download ZIP」下載的是原始碼，裡面沒有 exe。
 
 - 系統需求：Windows 10 或 11，不需要另外安裝 Python
 - 第一次開啟時，Windows 可能顯示「已保護您的電腦」。這是因為程式沒有購買數位簽章，點「其他資訊」→「仍要執行」即可。若想確認檔案沒被改過，可以比對 Release 頁面上的 SHA-256（做法見 [SECURITY.md](SECURITY.md)）。

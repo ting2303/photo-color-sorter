@@ -12,7 +12,11 @@ This tool looks at every photo for you: **what color of light is falling on the 
 
 ## Download
 
-Get `PhotoColorSorter-Windows.zip` (about 60 MB) from [Releases](../../releases/latest), unzip it, and run `PhotoColorSorter.exe`.
+### [⬇ Download PhotoColorSorter-Windows.zip (about 60 MB)](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
+
+Right-click the ZIP → **Extract All**, then run `PhotoColorSorter.exe` inside the folder.
+
+> Use the link above or the [Releases](../../releases/latest) page. The green **Code → Download ZIP** button gives you the source code, which does not include the exe.
 
 - Requires Windows 10 or 11. No Python installation needed.
 - On first launch Windows may show "Windows protected your PC" because the app is not code-signed. Click **More info → Run anyway**. To check the download hasn't been tampered with, compare its SHA-256 with the value on the Release page (see [SECURITY.md](SECURITY.md)).
