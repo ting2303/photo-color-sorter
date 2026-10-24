@@ -2,9 +2,10 @@
 
 自動判斷舞台照片中 **「臉被照成什麼顏色」** 與 **「整張照片的主要顏色」**，一鍵**改檔名**或**分資料夾**。匯入 Lightroom Classic 後用檔名排序，照片就會依燈光顏色排好，修圖更快。
 
-![主畫面](docs/images/screenshot-rename.png)
+![判斷範例](docs/images/examples.jpg)
+<sub>實際判斷結果。框線是偵測到的臉（已打馬賽克保護隱私），下方是「臉的顏色／整體主色」和產生的檔名前綴。</sub>
 
-- ✅ **免安裝**：下載解壓縮，雙擊就能用（Windows 10／11）
+- ✅ **簡單好用**：下載程式（約 60 MB）、解壓縮、雙擊開啟，不用另外裝 Python（Windows 10／11）
 - ✅ **完全離線**：不連網路、不上傳照片
 - ✅ **不會弄壞照片**：只改名或搬移，不修改內容、不刪檔，隨時可一鍵復原
 - ✅ **支援 RAW**：Canon、Nikon、Sony、Fujifilm 等主流 RAW，RAW + JPG + XMP 同名檔一起處理
@@ -45,6 +46,8 @@ python photo_color_sorter.py
 3. 切換上方選項檢查結果（不需重新分析）
 4. 按 **② 執行**
 5. 不滿意可按 **復原上一次**
+
+![主畫面](docs/images/screenshot-rename.png)
 
 ### 兩種輸出方式
 
@@ -117,6 +120,6 @@ python docs\build_tutorial.py       # 重新產生教學 PDF
 ---
 
 ## English
-**Photo Color Sorter** analyzes stage/concert photos and detects (1) the color of the light falling on performers' faces and (2) the dominant color of the whole image, then renames files with a sortable color prefix or sorts them into color folders — so Lightroom Classic can sort by filename and group shots by lighting. Runs fully offline on Windows; no installation required (download from [Releases](../../releases/latest)). Files are only renamed or moved, never modified or deleted, and every run can be undone.
+**Photo Color Sorter** analyzes stage/concert photos and detects (1) the color of the light falling on performers' faces and (2) the dominant color of the whole image, then renames files with a sortable color prefix or sorts them into color folders — so Lightroom Classic can sort by filename and group shots by lighting. Runs fully offline on Windows; just download the ~60 MB app, unzip and run — no Python setup needed (download from [Releases](../../releases/latest)). Files are only renamed or moved, never modified or deleted, and every run can be undone.
 
 **License:** [PolyForm Noncommercial 1.0.0](LICENSE) — free for personal and noncommercial use; **commercial use is not permitted** without a separate license from the author (contact [ting2303](https://github.com/ting2303)). Please read [DISCLAIMER.md](DISCLAIMER.md) before use. If you find it useful, a ⭐ is appreciated!

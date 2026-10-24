@@ -25,3 +25,4 @@ venv/
 _色彩分類紀錄_*.csv
 _色彩改名紀錄_*.csv
 !docs/images/*.png
+!docs/images/*.jpg

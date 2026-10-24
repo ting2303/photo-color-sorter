@@ -38,7 +38,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.0.1'
+__version__ = '1.0.2'
 
 try:
     import rawpy
