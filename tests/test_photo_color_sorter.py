@@ -147,3 +147,141 @@ class ModelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# ---------------------------------------------------------------- 挑圖輔助
+
+
+def tiff_exif(dt='2026:06:20 19:30:05', sub='25', big_endian=False):
+    """做一段最小的 TIFF/EXIF：IFD0 -> EXIF 子目錄 -> DateTimeOriginal + SubSecTimeOriginal"""
+    import struct
+    e = '>' if big_endian else '<'
+    dtb, subb = dt.encode() + b'\0', sub.encode() + b'\0'
+    ifd0_off = 8
+    exif_off = ifd0_off + 2 + 12 + 4
+    data_off = exif_off + 2 + 2 * 12 + 4
+    out = (b'MM' if big_endian else b'II') + struct.pack(e + 'HI', 42, ifd0_off)
+    out += struct.pack(e + 'H', 1) + struct.pack(e + 'HHII', 0x8769, 4, 1, exif_off) + struct.pack(e + 'I', 0)
+    out += struct.pack(e + 'H', 2)
+    out += struct.pack(e + 'HHII', 0x9003, 2, len(dtb), data_off)
+    out += struct.pack(e + 'HHI', 0x9291, 2, len(subb)) + subb.ljust(4, b'\0')[:4]
+    out += struct.pack(e + 'I', 0) + dtb
+    return out
+
+
+def jpeg_with_exif(img, tiff):
+    import struct
+    ok, buf = cv2.imencode('.jpg', img)
+    jpg = buf.tobytes()
+    app1 = b'Exif\0\0' + tiff
+    return jpg[:2] + b'\xff\xe1' + struct.pack('>H', len(app1) + 2) + app1 + jpg[2:]
+
+
+class PickingTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_capture_time_jpeg(self):
+        p = os.path.join(self.dir, 'a.jpg')
+        with open(p, 'wb') as fp:
+            fp.write(jpeg_with_exif(solid((255, 0, 0)), tiff_exif()))
+        t = pcs.read_capture_time(p)
+        self.assertEqual(t.strftime('%Y-%m-%d %H:%M:%S'), '2026-06-20 19:30:05')
+        self.assertEqual(t.microsecond, 250000)  # 小數秒 "25" = 0.25 秒
+
+    def test_capture_time_raw_big_endian(self):
+        p = os.path.join(self.dir, 'b.nef')
+        with open(p, 'wb') as fp:
+            fp.write(tiff_exif('2026:01:02 03:04:05', '7', big_endian=True))
+        t = pcs.read_capture_time(p)
+        self.assertEqual((t.hour, t.minute, t.second, t.microsecond), (3, 4, 5, 700000))
+
+    def test_capture_time_missing_or_broken(self):
+        p = os.path.join(self.dir, 'c.jpg')
+        save(p, solid((0, 0, 255)))  # 沒有 EXIF
+        self.assertIsNone(pcs.read_capture_time(p))
+        for content in (b'', b'\xff\xd8\xff', b'II*\0\xff\xff\xff\xff', os.urandom(5000)):
+            with open(p, 'wb') as fp:
+                fp.write(content)
+            self.assertIsNone(pcs.read_capture_time(p))
+
+    def make_results(self, spec):
+        """spec: [(秒數, 整體主色索引, 清晰度, 臉數)] -> 假的分析結果"""
+        import datetime
+        t0 = datetime.datetime(2026, 6, 20, 19, 0, 0)
+        out = []
+        for i, (sec, main, sharp, faces) in enumerate(spec):
+            out.append(dict(dir=self.dir, stem='P%03d' % i, source='P%03d.jpg' % i, files=['P%03d.jpg' % i],
+                            skin=pcs.WHITE, skin_ratio=0.8, faces=faces, main=main, main_ratio=0.6, top=[(main, 0.6)],
+                            highlight=0.0, main_perf=main, main_perf_ratio=0.6, top_perf=[(main, 0.6)],
+                            sharp=sharp, face_px=100.0 if faces else 0.0, face_bright=0.55 if faces else None,
+                            time=t0 + datetime.timedelta(seconds=sec), time_src='EXIF', error=None))
+        return out
+
+    def test_scenes_split_on_light_change_and_pause(self):
+        BLUE, RED = 5, 0
+        spec = [(i * 5, BLUE, 1.0, 1) for i in range(6)]            # 藍 6 張
+        spec += [(30 + i * 5, RED, 1.0, 1) for i in range(6)]       # 換紅 6 張
+        spec += [(400 + i * 5, RED, 1.0, 1) for i in range(5)]      # 停頓 5 分鐘後還是紅
+        rows = pcs.batch_features(self.make_results(spec))
+        self.assertEqual([r['scene'] for r in rows], [1] * 6 + [2] * 6 + [3] * 5)
+
+    def test_single_misread_does_not_split(self):
+        BLUE, RED = 5, 0
+        spec = [(i * 5, BLUE, 1.0, 1) for i in range(9)]
+        spec[4] = (20, RED, 1.0, 1)  # 中間一張誤判
+        rows = pcs.batch_features(self.make_results(spec))
+        self.assertEqual({r['scene'] for r in rows}, {1})
+
+    def test_representative_is_sharpest_face(self):
+        spec = [(0, 5, 0.2, 1), (5, 5, 0.9, 1), (10, 5, 2.0, 0), (15, 5, 0.5, 1)]
+        rows = pcs.batch_features(self.make_results(spec))
+        reps = [r['source'] for r in rows if r['rep']]
+        self.assertEqual(reps, ['P001.jpg'])  # 最清楚但沒臉的 P002 不選
+        self.assertEqual([r['sharp_score'] for r in rows], [0, 67, 100, 33])
+
+    def test_sorted_by_time_and_errors_kept(self):
+        spec = [(50, 5, 1.0, 1), (10, 5, 1.0, 1)]
+        res = self.make_results(spec) + [dict(dir=self.dir, stem='bad', source='bad.jpg', files=['bad.jpg'],
+                                               error='無法讀取圖片')]
+        rows = pcs.batch_features(res)
+        self.assertEqual([r['source'] for r in rows], ['P001.jpg', 'P000.jpg', 'bad.jpg'])
+
+    def test_uncertain_flag(self):
+        res = self.make_results([(0, 5, 1.0, 1)])
+        res[0]['main_ratio'] = 0.3
+        self.assertTrue(pcs.batch_features(res)[0]['uncertain'])
+
+    def test_performer_weighting(self):
+        """演出者站在小塊藍光裡，背景是大片粉色 LED：偏重演出者時應判藍"""
+        img = solid((180, 60, 255))            # 粉色背景佔約 2/3
+        img[60:300, 120:280] = (255, 90, 20)   # 演出者身上的藍光，約 1/3
+        box = [(180 / 400, 70 / 300, 40 / 400, 27 / 300)]  # 臉框
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '粉')
+        self.assertEqual(pcs.label(pcs.analyze_overall(img, performer_boxes=box)[0]), '藍')
+
+    def test_effective_switches_main(self):
+        r = self.make_results([(0, 5, 1.0, 1)])[0]
+        r['main_perf'] = 0
+        self.assertEqual(pcs.effective(r, True)['main'], 0)
+        self.assertEqual(pcs.effective(r, False)['main'], 5)
+
+    def test_analyze_group_and_export(self):
+        p = os.path.join(self.dir, 'IMG_1.jpg')
+        with open(p, 'wb') as fp:
+            fp.write(jpeg_with_exif(solid((255, 0, 0)), tiff_exif()))
+        res = [pcs.analyze_group(g) for g in pcs.collect_groups(self.dir)]
+        self.assertIsNone(res[0]['error'])
+        self.assertEqual(res[0]['time_src'], 'EXIF')
+        rows = pcs.batch_features(res)
+        out = os.path.join(self.dir, 'out.csv')
+        pcs.export_csv(rows, out)
+        with open(out, encoding='utf-8-sig') as fp:
+            data = list(csv.reader(fp))
+        self.assertEqual(data[0][0], '檔名')
+        self.assertEqual(data[1][0], 'IMG_1.jpg')
+        self.assertEqual(data[1][3], 'S01')
+        self.assertTrue(data[1][14].startswith('無6藍_'))
