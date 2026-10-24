@@ -75,7 +75,7 @@ To work on one lighting look at a time, use **Library Filter → Text → Filena
 
 - **Face detection** uses OpenCV's [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) model. It doesn't rely on color, so stage lighting doesn't throw it off, and it finds small faces in wide shots. It only finds *where* faces are — it does not identify anyone.
 - **Face color**: the hue of the central area of each face is counted, and the most common color wins. Larger, more confident detections carry more weight.
-- **Overall color**: dark areas are ignored; bright colored light dominates.
+- **Overall color**: dark areas are ignored; bright colored light dominates. Light bursts, starbursts and blown-out white costumes (very bright, almost colorless) do not vote, so a few bursts can no longer turn a whole photo 白 (white); as they cover more of the lit area (from 20% to 50%), their votes are gradually restored, so a largely blown-out white-light scene is still classed as white. The 燈光爆點 (light bursts) column shows that share.
 
 Detection is automatic and will sometimes be wrong — a background graphic mistaken for a face, or cool white light read as blue. Sensitivity settings are at the top of `photo_color_sorter.py`.
 

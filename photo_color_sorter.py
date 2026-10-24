@@ -38,7 +38,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.0.2'
+__version__ = '1.0.3'
 
 try:
     import rawpy
@@ -79,6 +79,9 @@ TAG_COLORS = ['#ffb3b3', '#ffd6a6', '#fff3a6', '#bff0bf', '#b3f0f0', '#b3c8ff',
 DARK_V = 0.12             # 亮度低於此值視為黑暗，不列入計算
 NEUTRAL_S = 0.25          # 整體：飽和度低於此值視為白光/無色
 NEUTRAL_MIN_V = 0.35      # 整體：無色像素至少要這麼亮才算「白光」（避免灰暗地板干擾）
+HIGHLIGHT_V = 0.92        # 整體：比這更亮……
+HIGHLIGHT_S = NEUTRAL_S   # ……而且是無色 = 燈光爆點／星芒／過曝白衣
+HIGHLIGHT_RAMP = (0.2, 0.5)  # 整體：爆點佔亮區低於 20% 完全不投票，20%→50% 票數逐漸恢復，50% 以上照常投票
 SKIN_NATURAL_S = 0.62     # 膚色：在膚色色相範圍內且飽和度低於此值 = 自然光
 SKIN_NATURAL_HUE = (5, 40)
 
@@ -143,24 +146,42 @@ def hue_category(h):
 # ---------------------------------------------------------------- 整體主色
 
 
-def analyze_overall(img):
+def analyze_overall(img, return_highlight=False):
+    """回傳 (主色, 比例, 前三名)；return_highlight=True 時再多回傳爆點佔亮區的比例。
+
+    燈光爆點、星芒、過曝的白衣服又亮又沒顏色，照亮度加權時票數很重，
+    少數幾個爆點就能把整張照片拉成「白」，所以爆點少時不讓它們投票。
+    但爆點佔亮區的比例本身就是線索：佔得越多，越可能是整片白光（過曝的白光場景），
+    所以爆點的票數依比例逐漸恢復（HIGHLIGHT_RAMP），不會在某個比例突然跳成白。
+    比例與前三名都是同一套加權票數的佔比。
+    """
     h, s, v = to_hsv(resize_max(img, 400))
-    valid = v >= DARK_V
-    if valid.mean() < 0.03:
-        return DARK, 1.0, []
+    lit = v >= DARK_V
+    highlight = lit & (v > HIGHLIGHT_V) & (s < HIGHLIGHT_S)
+    hl_frac = float(highlight.sum() / max(int(lit.sum()), 1))
+
+    def done(key, ratio, top):
+        return (key, ratio, top, hl_frac) if return_highlight else (key, ratio, top)
+
+    # 用排除爆點前的亮像素判斷暗不暗；否則幾乎全過曝的照片會被誤判成「暗」
+    if lit.mean() < 0.03:
+        return done(DARK, 1.0, [])
+    lo, hi = HIGHLIGHT_RAMP
+    hl_weight = min(max((hl_frac - lo) / (hi - lo), 0.0), 1.0)  # 爆點票數的倍率 0~1
     cat = hue_category(h)
     neutral = s < NEUTRAL_S
     cat = np.where(neutral, WHITE, cat)
-    # 越亮的像素權重越高；暗沉的灰色不算白光
+    # 越亮的像素權重越高；暗沉的灰色不算白光；爆點依比例打折
     w = np.where(neutral & (v < NEUTRAL_MIN_V), 0.0, v ** 2)
-    hist = np.bincount(cat[valid], weights=w[valid], minlength=len(CATEGORIES))
+    w = np.where(highlight, w * hl_weight, w)
+    hist = np.bincount(cat[lit], weights=w[lit], minlength=len(CATEGORIES))
     total = hist.sum()
-    if total <= 0:
-        return DARK, 1.0, []
+    if total <= 0:  # 其餘都是暗沉灰色：有爆點就是白光，沒有才是暗
+        return done(WHITE, 1.0, [(WHITE, 1.0)]) if highlight.any() else done(DARK, 1.0, [])
     hist = hist / total
     order = np.argsort(hist)[::-1]
     top = [(int(i), float(hist[i])) for i in order[:3] if hist[i] > 0.05]
-    return int(order[0]), float(hist[order[0]]), top
+    return done(int(order[0]), float(hist[order[0]]), top)
 
 # ---------------------------------------------------------------- 人臉膚色
 
@@ -321,9 +342,9 @@ def analyze_group(group):
     try:
         img = load_image(path)
         skin, skin_ratio, nfaces = analyze_skin(img)
-        main, main_ratio, top = analyze_overall(img)
+        main, main_ratio, top, highlight = analyze_overall(img, return_highlight=True)
         return dict(group, skin=skin, skin_ratio=skin_ratio, faces=nfaces,
-                    main=main, main_ratio=main_ratio, top=top, error=None)
+                    main=main, main_ratio=main_ratio, top=top, highlight=highlight, error=None)
     except Exception as e:
         return dict(group, error=str(e))
 
@@ -536,9 +557,9 @@ def run_gui(initial_folder=None):
     pbar.pack(side='right')
 
     # --- 預覽表格
-    cols = ('file', 'faces', 'skin', 'skin_r', 'main', 'main_r', 'top', 'new')
-    heads = ('原檔名', '臉數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '結果')
-    widths = (200, 45, 50, 65, 50, 65, 170, 400)
+    cols = ('file', 'faces', 'skin', 'skin_r', 'main', 'main_r', 'top', 'hl', 'new')
+    heads = ('原檔名', '臉數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '結果')
+    widths = (200, 45, 50, 65, 50, 65, 170, 65, 335)
     frame = ttk.Frame(root)
     frame.pack(fill='both', expand=True, padx=8)
     tree = ttk.Treeview(frame, columns=cols, show='headings')
@@ -567,7 +588,7 @@ def run_gui(initial_folder=None):
         sort_key = slot_order(mode.get(), order.get())[0]
         for r in state['results']:
             if r.get('error'):
-                tree.insert('', 'end', values=(r['source'], '', '錯誤', '', '', '', r['error'], ''), tags=('err',))
+                tree.insert('', 'end', values=(r['source'], '', '錯誤', '', '', '', r['error'], '', ''), tags=('err',))
                 continue
             clean = strip_prefix(r['source'])
             if output.get() == 'folder':
@@ -581,7 +602,8 @@ def run_gui(initial_folder=None):
             tree.insert('', 'end', tags=('c%d' % r[sort_key],), values=(
                 r['source'], r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
-                label(r['main']), '%d%%' % (r['main_ratio'] * 100), top3, new))
+                label(r['main']), '%d%%' % (r['main_ratio'] * 100), top3,
+                '%d%%' % (r.get('highlight', 0) * 100), new))
 
     def check_folder():
         f = folder.get().strip()
@@ -723,9 +745,9 @@ def run_cli(argv):
         if r.get('error'):
             print('[錯誤] %s：%s' % (r['source'], r['error']))
         else:
-            print('%-40s 臉:%d 膚色:%s(%d%%) 整體:%s(%d%%)' % (
+            print('%-40s 臉:%d 膚色:%s(%d%%) 整體:%s(%d%%) 爆點:%d%%' % (
                 r['source'], r['faces'], label(r['skin']), r['skin_ratio'] * 100,
-                label(r['main']), r['main_ratio'] * 100))
+                label(r['main']), r['main_ratio'] * 100, r.get('highlight', 0) * 100))
     plan = plan_renames(results, a.mode, a.order, not a.no_digits, a.output)
     for old, new in plan:
         print('  %s -> %s' % (os.path.basename(old), os.path.relpath(new, os.path.dirname(old))))
