@@ -95,6 +95,17 @@ Manual controls in the advanced panel:
 - **燈光段落 (scenes): auto / manual / auto + manual**: type file numbers (e.g. `2921, 3040, 3074`) to start a new scene at those photos. Without an exact match the nearest larger number is used; numbers that match nothing are listed in the status bar
 - **舞台顏色 (stage colour): standard / pale**: try 淡色舞台 (pale) when the whole show's lighting is faint and most photos come out white. The trade-off: genuine white-light scenes get classed as coloured, and already-graded photos tend to read skin as red light, so compare with standard before using it. The analysis report warns about this
 
+- **挑圖功能 (picking features)**: picks, stars, person groups, brightness groups, WB start and the lighting timeline can each be turned on or off. Turning off person groups makes analysis much faster
+
+Your last settings are remembered (saved as `.photo_color_sorter.json` in your user folder).
+
+Easier reading:
+
+- When sorted by capture time, the table is grouped by scene with a header row per scene (count, main colour, time span, which photo to edit first); scenes can be collapsed
+- Each row starts with a small swatch: left half = face colour, right half = overall colour; the legend uses colour chips too
+- A **lighting timeline** strip above the table shows the whole show; click it to jump to that scene
+- Report notes are colour-coded: ⚠ attention, ℹ info, ✓ OK
+
 Other options:
 
 - **整體偏重演出者 (weight the performer)**: tick it when the LED wall behind is very colorful, so the light around the performer counts more

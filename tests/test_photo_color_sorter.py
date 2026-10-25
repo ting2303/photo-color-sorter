@@ -689,3 +689,48 @@ class ManualControlTests(FakeRows, unittest.TestCase):
         spec = [dict(stage='pale', skin=0) for _ in range(10)]
         _, notes = pcs.build_report(pcs.batch_features(self.rows(spec)))
         self.assertIn('建議改回「標準」', '\n'.join(notes))
+
+
+class FeatureToggleTests(FakeRows, unittest.TestCase):
+    """挑圖功能開關、記住設定"""
+
+    def test_settings_roundtrip_and_broken_file(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, 's.json')
+            self.assertEqual(pcs.load_settings(path), {})  # 沒有檔案
+            self.assertTrue(pcs.save_settings({'mode': 'skin', 'features': {'person': False}}, path))
+            self.assertEqual(pcs.load_settings(path)['features'], {'person': False})
+            with open(path, 'w') as fp:
+                fp.write('{broken')
+            self.assertEqual(pcs.load_settings(path), {})  # 壞掉的檔案不會讓程式出錯
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_person_off_skips_embedding(self):
+        d = tempfile.mkdtemp()
+        try:
+            save(os.path.join(d, 'a.jpg'), solid((255, 0, 0)))
+            g = pcs.collect_groups(d)[0]
+            self.assertIsNone(pcs.analyze_group(g, person=False)['face_emb'])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_report_and_csv_respect_features(self):
+        rows = pcs.batch_features(self.rows([dict() for _ in range(12)]))
+        off = {'stars': False, 'person': False, 'wb': False}
+        lines, _ = pcs.build_report(rows, features=off)
+        text = '\n'.join(lines)
+        self.assertFalse([x for x in lines if x.startswith(('自動評分', '人物分組', '調色起點'))])
+        self.assertIn('已關閉：星等、人物分組、調色起點', text)
+        d = tempfile.mkdtemp()
+        try:
+            out = os.path.join(d, 'o.csv')
+            pcs.export_csv(rows, out, features=off)
+            with open(out, encoding='utf-8-sig') as fp:
+                data = list(csv.reader(fp))
+            col = {n: i for i, n in enumerate(data[0])}
+            self.assertEqual({data[1][col[k]] for k in ('星等', '評分說明', '人物', '調色起點建議')}, {''})
+            self.assertNotEqual(data[1][col['亮度']], '')  # 沒關的照常輸出
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
