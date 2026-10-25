@@ -734,3 +734,83 @@ class FeatureToggleTests(FakeRows, unittest.TestCase):
             self.assertNotEqual(data[1][col['亮度']], '')  # 沒關的照常輸出
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+
+class ExtremeInputTests(FakeRows, unittest.TestCase):
+    """極端輸入與輸出：細長圖、Excel 公式檔名、寫不了紀錄檔、全黑的臉"""
+
+    def test_degenerate_images_have_no_phantom_faces(self):
+        rng = np.random.default_rng(0)
+        noise = rng.integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+        for shape in ((3, 10000, 3), (10, 10000, 3), (9000, 3, 3), (1, 1, 3)):
+            img = rng.integers(0, 255, shape, dtype=np.uint8)
+            for before in (None, solid((128, 128, 128), (600, 800)), noise):  # 前一張是什麼都不能影響結果
+                if before is not None:
+                    pcs.analyze_skin(before)
+                self.assertEqual(pcs.analyze_skin(img)[2], 0, shape)
+
+    def test_csv_escapes_formula_filenames(self):
+        rows = pcs.batch_features(self.rows([dict(source='=1+1.jpg', files=['=1+1.jpg'])]))
+        d = tempfile.mkdtemp()
+        try:
+            out = os.path.join(d, 'o.csv')
+            pcs.export_csv(rows, out)
+            with open(out, encoding='utf-8-sig') as fp:
+                data = list(csv.reader(fp))
+            self.assertEqual(data[1][0], "'=1+1.jpg")
+            self.assertEqual(pcs._cell('DSC_1.jpg'), 'DSC_1.jpg')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_no_rename_when_log_cannot_be_written(self):
+        import builtins
+        from unittest import mock
+        d = tempfile.mkdtemp()
+        try:
+            a = os.path.join(d, 'a.jpg')
+            save(a, solid((255, 0, 0)))
+            real_open = builtins.open
+
+            def fake_open(path, *args, **kw):
+                if pcs.LOG_PREFIX in str(path):
+                    raise OSError('No space left on device')
+                return real_open(path, *args, **kw)
+            with mock.patch('builtins.open', fake_open):
+                done, errors, log = pcs.apply_renames([(a, os.path.join(d, '6藍_a.jpg'))], d)
+            self.assertEqual((done, log), ([], None))
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(os.path.exists(a))  # 沒有被改名
+            self.assertFalse([f for f in os.listdir(d) if f.startswith(pcs.LOG_PREFIX)])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_empty_plan_leaves_no_log(self):
+        d = tempfile.mkdtemp()
+        try:
+            self.assertEqual(pcs.apply_renames([], d), ([], [], None))
+            self.assertEqual(os.listdir(d), [])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_black_face_counts_as_dark(self):
+        rows = pcs.batch_features(self.rows([dict(face_bright=0.6)] * 4 + [dict(face_bright=0.0)]))
+        self.assertEqual(rows[-1]['bright'], '暗')
+
+    def test_timeline_compresses_long_gaps(self):
+        import datetime
+        rows = self.rows([dict() for _ in range(5)])  # 每 5 秒一張
+        rows[-1]['time'] = datetime.datetime(2099, 12, 31)  # 相機時間設錯的一張
+        xs = pcs.timeline_positions(rows)
+        self.assertEqual((xs[0], xs[-1]), (0.0, 1.0))
+        self.assertGreater(xs[3], 0.3)  # 其他照片沒有被擠在最左邊
+        self.assertEqual(xs, sorted(xs))
+        same = self.rows([dict(time=rows[0]['time']) for _ in range(3)])
+        self.assertEqual(pcs.timeline_positions(same), [0.0, 0.5, 1.0])
+        self.assertEqual(pcs.timeline_positions(rows[:1]), [0.0])
+
+    def test_report_flags_future_capture_time(self):
+        import datetime
+        rows = self.rows([dict() for _ in range(3)])
+        rows[1]['time'] = datetime.datetime(2099, 1, 1)
+        _, notes = pcs.build_report(pcs.batch_features(rows))
+        self.assertTrue([x for x in notes if x.startswith('ℹ 1 張的拍攝時間在未來')])
