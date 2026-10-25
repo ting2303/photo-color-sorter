@@ -93,7 +93,11 @@ UNCERTAIN_RATIO = 0.35    # 主色票數低於此比例時，表格標示「?」
 SCENE_GAP_SEC = 60        # 燈光段落：兩張照片間隔超過這麼多秒就切成新段落
 SCENE_MIN_LEN = 3         # 燈光段落：少於這麼多張的段落併入前一段（避免單張誤判切出一堆小段）
 BRIGHT_EV = (-0.5, -1.5)  # 亮度分組：和參考亮度相差 0.5 級內為亮、1.5 級內為中，更暗為暗
-STAR_BLUR_SCORE = 15      # 自動評分：清晰度低於此分（整批最後約 15%）給 1 星
+STAR_BLUR_SCORE = 15      # 自動評分：清晰度在整批最後 15%，而且……
+BLUR_RATIO = 0.9          # ……清晰度低於整批中位數的 90%，才算可能模糊（整批都清楚時不會硬挑出模糊照）
+BLUR_RATIO_STRONG = 0.7   # 低於整批中位數的 70% 時，不論排名都算可能模糊
+DARK_FACE = 0.12          # 臉部亮度低於此值：太暗，清晰度不可靠，評分理由寫「臉太暗」
+GRAY_FACE_CHROMA = 3      # 臉的色度低於此值視為黑白照片，不給調色建議
 WB_MIN_SHIFT = 4          # 調色起點：臉的色偏小於此值（Lab 色度差）視為正常
 SKIN_NATURAL_S = 0.62     # 膚色：在膚色色相範圍內且飽和度低於此值 = 自然光
 SKIN_NATURAL_HUE = (5, 40)
@@ -404,8 +408,15 @@ def collect_groups(folder, recursive=False):
         raws = [f for f in files if os.path.splitext(f)[1].lower() in RAW_EXTS]
         if not imgs and not raws:
             continue  # 只有 xmp
+        imgs = sorted(imgs)
         source = (imgs or raws)[0]  # 有 JPG 就用 JPG（較快）
-        result.append({'dir': d, 'stem': stem, 'files': sorted(files), 'source': source})
+        # 同名但格式不同的「照片」（例如 x.jpg 與 x.png）是不同的照片，各自分析；
+        # RAW、XMP 只跟第一張照片配對（相機的 RAW+JPG 同名檔）
+        others = imgs[1:]
+        main_files = [f for f in files if f not in others]
+        result.append({'dir': d, 'stem': stem, 'files': sorted(main_files), 'source': source})
+        for f in others:
+            result.append({'dir': d, 'stem': stem, 'files': [f], 'source': f})
     return result
 
 
@@ -537,7 +548,9 @@ def face_lab(work, faces):
     sel = mask > 0
     if sel.sum() < 20:
         return None
-    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)[sel].astype(np.float32)
+    ys, xs = np.nonzero(sel)  # 只轉換臉部範圍，不轉整張圖
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    lab = cv2.cvtColor(work[y0:y1, x0:x1], cv2.COLOR_BGR2LAB)[sel[y0:y1, x0:x1]].astype(np.float32)
     return float(np.median(lab[:, 1]) - 128), float(np.median(lab[:, 2]) - 128)
 
 
@@ -590,7 +603,23 @@ def analyze_group(group):
                     sharp=sharp, face_px=face_px, face_bright=face_bright, face_emb=emb, face_ab=ab,
                     time=t, time_src=t_src, error=None)
     except Exception as e:
-        return dict(group, error=str(e))
+        return dict(group, error=friendly_error(e))
+
+
+def friendly_error(e):
+    """把程式內部的錯誤訊息換成看得懂的說明"""
+    msg = str(e)
+    if 'Unsupported file format' in msg or 'not RAW file' in msg:
+        return '不支援的 RAW 格式，或檔案已損壞'
+    if isinstance(e, MemoryError):
+        return '圖片太大，記憶體不足'
+    if isinstance(e, (FileNotFoundError, PermissionError)):
+        return '無法開啟檔案（可能已被移動、刪除或沒有權限）'
+    if isinstance(e, cv2.error) or 'buf.empty' in msg or '無法讀取圖片' in msg:
+        return '無法讀取圖片（檔案可能損壞、是空檔，或不是真的圖片）'
+    if 'rawpy' in msg:
+        return msg
+    return '分析失敗：%s' % msg.splitlines()[0][:120] if msg else '分析失敗'
 
 
 def effective(r, performer=False):
@@ -726,13 +755,20 @@ def _assign_brightness(rows):
 
 def _assign_stars(rows):
     """自動評分 1~3 星（整批相對，用來初篩）：
-    1 星 = 沒有臉，或清晰度在整批最後 15%；
+    1 星 = 沒有臉、臉太暗，或可能模糊（清晰度在整批最後 15% 且低於整批中位數的 90%，或低於 70%）；
     3 星 = 清晰度前段（≥50）、臉不小於整批中位數、亮度為亮或中、臉沒有過曝或太暗；其餘 2 星。"""
     sizes = [r['face_px'] for r in rows if r['faces']]
     med = float(np.median(sizes)) if sizes else 0.0
+    sharp_med = float(np.median([r['sharp'] for r in rows])) if rows else 0.0
     for r in rows:
-        if not r['faces'] or r['sharp_score'] < STAR_BLUR_SCORE:
-            r['stars'], r['star_why'] = 1, '沒有臉' if not r['faces'] else '可能模糊'
+        ratio = r['sharp'] / sharp_med if sharp_med > 0 else 1.0
+        fb = r.get('face_bright')
+        too_dark = fb is not None and fb < DARK_FACE
+        # 臉偏暗（< 0.2）時細節被壓掉，清晰度不可靠，不判模糊（改在 2 星理由寫「臉太暗」）
+        blurry = (ratio < BLUR_RATIO_STRONG or (r['sharp_score'] < STAR_BLUR_SCORE and ratio < BLUR_RATIO)) \
+            and not (fb is not None and fb < 0.2)
+        if not r['faces'] or too_dark or blurry:
+            r['stars'], r['star_why'] = 1, '沒有臉' if not r['faces'] else '臉太暗' if too_dark else '可能模糊'
         elif (r['sharp_score'] >= 50 and r['face_px'] >= med and r.get('bright') in ('亮', '中')
               and r.get('face_bright') is not None and 0.2 <= r['face_bright'] <= 0.9):
             r['stars'], r['star_why'] = 3, ''
@@ -768,6 +804,8 @@ def _assign_wb(rows):
         ref = refs.get(r.get('person'), all_ref)
         if not r.get('face_ab') or ref is None:
             continue
+        if float(np.hypot(*r['face_ab'])) < GRAY_FACE_CHROMA:
+            continue  # 黑白照片：臉沒有顏色，不給調色建議
         da, db = r['face_ab'][0] - ref[0], r['face_ab'][1] - ref[1]
         r['wb_shift'] = float(np.hypot(da, db))
         r['wb_temp'], r['wb_tint'] = -db, -da
@@ -782,7 +820,7 @@ def wb_text(r):
     return '色溫%+d 色調%+d' % (round(r['wb_temp']), round(r['wb_tint']))
 
 
-def build_report(rows, mode='both', order='skin'):
+def build_report(rows, mode='both', order='skin', performer=False):
     """分析報告：整批結果的統計，以及需要注意的地方。回傳 (摘要行清單, 提醒清單)。
     提醒依「⚠ 需要注意」與「ℹ 參考」分級，讓使用者知道這次的結果可不可靠、該怎麼調。"""
     ok = [r for r in rows if not r.get('error')]
@@ -816,7 +854,13 @@ def build_report(rows, mode='both', order='skin'):
     br = {b: sum(r.get('bright') == b for r in ok) for b in ('亮', '中', '暗')}
     lines.append('亮度分組：亮 %d、中 %d、暗 %d' % (br['亮'], br['中'], br['暗']))
     shifted = [r for r in ok if r.get('wb_shift') is not None and r['wb_shift'] >= WB_MIN_SHIFT]
-    lines.append('調色起點：%d 張的臉有明顯色偏，建議先調白平衡' % len(shifted))
+    has_ref = any(r.get('wb_shift') is not None for r in ok)
+    if not with_face:
+        lines.append('調色起點：沒有偵測到臉，無法建議')
+    elif not has_ref:
+        lines.append('調色起點：沒有在自然光下的臉可當基準，無法建議（每張臉都被色光照到，或是黑白照片）')
+    else:
+        lines.append('調色起點：%d 張的臉有明顯色偏，建議先調白平衡' % len(shifted))
 
     white = sum(r['main'] == WHITE for r in ok)
     unc = sum(r['uncertain'] for r in ok)
@@ -827,17 +871,29 @@ def build_report(rows, mode='both', order='skin'):
         notes.append('⚠ %.0f%% 的照片整體判成白：可能是白光為主或顏色很淡的舞台，'
                      '可以改用「只看膚色」，或把顏色明顯的段落另外處理' % pct(white))
     if n >= 10 and pct(unc) >= 40:
-        notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：畫面顏色很雜，背景 LED 螢幕很花時可以勾「整體偏重演出者」' % pct(unc))
+        if performer:
+            notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：已經勾了「整體偏重演出者」仍然偏低，代表打在人身上的光本身就很雜，'
+                         '建議改用「只看膚色」，或人工確認標「?」的照片' % pct(unc))
+        else:
+            notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：畫面顏色很雜，背景 LED 螢幕很花時可以勾「整體偏重演出者」' % pct(unc))
     if n >= 5 and pct(noface) >= 50:
         notes.append('⚠ %.0f%% 的照片沒偵測到臉：膚色、人物分組、亮度與評分會較少，建議以「只看整體」分類' % pct(noface))
     if exif == 0:
         notes.append('ℹ 沒有讀到任何拍攝時間（可能是截圖、轉存或社群下載的照片），段落與時間序號改用檔案時間，順序可能不準')
     elif exif < n:
         notes.append('ℹ %d 張沒有拍攝時間，改用檔案時間（表格時間後面有 *）' % (n - exif))
-    if sface_available() and len(with_face) >= 6 and len(persons) > max(3, len(with_face) // 3):
-        notes.append('ℹ 人物分組有 %d 組，可能比實際人數多：濃妝、側臉、臉太小或模糊都會讓同一人被拆開' % len(persons))
-    if n >= 10 and stars[1] >= 0.5 * n:
-        notes.append('ℹ 一半以上是 1 星：評分是整批相對比較，如果整批都很清楚，請以清晰度數字為準')
+    if sface_available() and len(with_face) >= 10:
+        size = {}
+        for r in ok:
+            if r.get('person'):
+                size[r['person']] = size.get(r['person'], 0) + 1
+        small = [k for k, v in size.items() if v <= 2]
+        if len(small) >= 2:
+            notes.append('ℹ 人物分組有 %d 組只有 1～2 張，可能是同一人被拆開（濃妝、側臉、臉太小或模糊），可以用「表格排序：人物」人工確認'
+                         % len(small))
+    blur1 = sum(r['stars'] == 1 and r.get('star_why') == '可能模糊' for r in ok)
+    if n >= 10 and blur1 >= 0.3 * n:
+        notes.append('ℹ %d 張被評為可能模糊（%.0f%%）：如果現場本來就很暗或有大量動態，可以改看清晰度數字挑選' % (blur1, pct(blur1)))
     if scenes >= 0.6 * n and n >= 10:
         notes.append('ℹ 段落很碎（%d 張分成 %d 段）：燈光變化很快，或拍攝時間不連續' % (n, scenes))
     if not notes:
@@ -845,8 +901,8 @@ def build_report(rows, mode='both', order='skin'):
     return lines, notes
 
 
-def report_text(rows, mode='both', order='skin', folder=None):
-    lines, notes = build_report(rows, mode, order)
+def report_text(rows, mode='both', order='skin', folder=None, performer=False):
+    lines, notes = build_report(rows, mode, order, performer)
     head = ['舞台照片色彩分類工具 v%s 分析報告' % __version__,
             '時間：%s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
     if folder:
@@ -1291,7 +1347,7 @@ def run_gui(initial_folder=None):
                     state['results'] = msg[1]
                     refresh_table()
                     errs = sum(1 for r in msg[1] if r.get('error'))
-                    _, notes = build_report(current_rows()[0], mode.get(), order.get())
+                    _, notes = build_report(current_rows()[0], mode.get(), order.get(), performer.get())
                     warn = [x for x in notes if x.startswith('⚠')]
                     status.set('分析完成：%d 張%s。%s' % (
                         len(msg[1]), '，%d 張讀取失敗' % errs if errs else '',
@@ -1394,7 +1450,7 @@ def run_gui(initial_folder=None):
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
         rows, _ = current_rows()
-        text = report_text(rows, mode.get(), order.get(), folder.get().strip())
+        text = report_text(rows, mode.get(), order.get(), folder.get().strip(), performer.get())
         win = tk.Toplevel(root)
         win.title('分析報告')
         win.geometry('720x520')
@@ -1552,7 +1608,7 @@ def run_cli(argv):
                 r.get('bright') or '-', r['faces'], label(r['skin']), r['skin_ratio'] * 100, label(r['main']),
                 '?' if r['uncertain'] else '', r['main_ratio'] * 100, r.get('highlight', 0) * 100, wb_text(r)))
     if a.report:
-        text = report_text(rows, a.mode, a.order, a.folder)
+        text = report_text(rows, a.mode, a.order, a.folder, a.performer)
         print('\n' + text)
         if a.report != '-':
             with open(a.report, 'w', encoding='utf-8-sig') as fp:
