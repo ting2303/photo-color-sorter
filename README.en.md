@@ -92,6 +92,8 @@ The main window keeps only the common settings. Everything else is under 進階�
 
 Manual controls in the advanced panel:
 
+![Advanced settings](docs/images/screenshot-advanced.png)
+
 - **燈光段落 (scenes): auto / manual / auto + manual**: type file numbers (e.g. `2921, 3040, 3074`) to start a new scene at those photos. Without an exact match the nearest larger number is used; numbers that match nothing are listed in the status bar
 - **舞台顏色 (stage color): standard / pale**: try 淡色舞台 (pale) when the whole show's lighting is faint and most photos come out white. The trade-off: genuine white-light scenes get classed as colored, and already-graded photos tend to read skin as red light, so compare with standard before using it. The analysis report warns about this
 - **挑圖功能 (picking features)**: picks, stars, person groups, brightness groups, WB start and the lighting timeline can each be turned on or off. Turning off person groups makes analysis much faster
@@ -112,6 +114,8 @@ Other options:
 - **匯出 CSV (export CSV)**: saves the table into the photo folder; opens in Excel
 - **Large lighting timeline**: 工具 → 燈光時間軸 (tools → lighting timeline) opens a bigger view of the show's lighting, scene boundaries and picks
 - **分析報告 (analysis report)**: batch statistics plus anything to watch out for (e.g. most photos classed white, no capture times, many photos without a detected face) and what to change. The status bar also says how many items need attention
+
+<img src="docs/images/screenshot-report.png" alt="Analysis report" width="560">
 
 ## Restoring names after editing
 
