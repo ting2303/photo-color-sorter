@@ -26,6 +26,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
   命令列：    python photo_color_sorter.py <資料夾> --preview|--apply [--output rename|folder]
               [--mode both|skin|main] [--order skin|main] [--no-digits] [-r]
               [--performer] [--csv 結果.csv] [--time-seq] [--report [報告.txt]]
+              [--stage standard|pale] [--scenes auto|manual|both --splits "2921,3040"]
   還原修圖後檔名：python photo_color_sorter.py <輸出資料夾> --restore [--log-folder 原始資料夾] [--apply]
 """
 import os
@@ -44,7 +45,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 try:
     import rawpy
@@ -101,6 +102,20 @@ GRAY_FACE_CHROMA = 3      # 臉的色度低於此值視為黑白照片，不給�
 WB_MIN_SHIFT = 4          # 調色起點：臉的色偏小於此值（Lab 色度差）視為正常
 SKIN_NATURAL_S = 0.62     # 膚色：在膚色色相範圍內且飽和度低於此值 = 自然光
 SKIN_NATURAL_HUE = (5, 40)
+SKIN_NEUTRAL_S = 0.12     # 膚色：飽和度低於此值一律算自然光
+
+# 舞台顏色濃淡：手動選擇。「淡」適合整場燈光顏色很淡的舞台，代價是真正的白光場景容易被判成有色
+STAGE_PRESETS = {
+    'standard': dict(DARK_V=0.12, NEUTRAL_S=0.25, NEUTRAL_MIN_V=0.35, SKIN_NATURAL_S=0.62,
+                     SKIN_NATURAL_HUE=(5, 40), SKIN_NEUTRAL_S=0.12),
+    'pale': dict(DARK_V=0.15, NEUTRAL_S=0.14, NEUTRAL_MIN_V=0.30, SKIN_NATURAL_S=0.42,
+                 SKIN_NATURAL_HUE=(8, 35), SKIN_NEUTRAL_S=0.08),
+}
+STAGE_NAMES = {'standard': '標準', 'pale': '淡色舞台'}
+
+
+def apply_stage_preset(name='standard'):
+    globals().update(STAGE_PRESETS.get(name, STAGE_PRESETS['standard']))
 
 _COLOR_CHARS = ''.join(c[1] for c in CATEGORIES)
 # 新格式（可帶時間序號，例如 8粉_0012_）| 舊版長格式
@@ -346,7 +361,7 @@ def analyze_skin(img, return_faces=False):
             continue
         h, s = h[valid], s[valid]
         cat = hue_category(h)
-        natural = (s < 0.12) | ((h >= SKIN_NATURAL_HUE[0]) & (h < SKIN_NATURAL_HUE[1]) & (s < SKIN_NATURAL_S))
+        natural = (s < SKIN_NEUTRAL_S) | ((h >= SKIN_NATURAL_HUE[0]) & (h < SKIN_NATURAL_HUE[1]) & (s < SKIN_NATURAL_S))
         cat = np.where(natural, WHITE, cat)
         face_hist = np.bincount(cat, minlength=len(CATEGORIES)).astype(np.float64)
         hist += face_hist / face_hist.sum() * score * np.sqrt(fw * fh)
@@ -578,7 +593,8 @@ def photo_metrics(work, faces):
     return float(sharp), face_px, face_bright
 
 
-def analyze_group(group):
+def analyze_group(group, stage='standard'):
+    apply_stage_preset(stage)
     path = os.path.join(group['dir'], group['source'])
     try:
         img = load_image(path)
@@ -601,7 +617,7 @@ def analyze_group(group):
                     main=main, main_ratio=main_ratio, top=top, highlight=highlight,
                     main_perf=main_p, main_perf_ratio=main_p_ratio, top_perf=top_p,
                     sharp=sharp, face_px=face_px, face_bright=face_bright, face_emb=emb, face_ab=ab,
-                    time=t, time_src=t_src, error=None)
+                    time=t, time_src=t_src, stage=stage, error=None)
     except Exception as e:
         return dict(group, error=friendly_error(e))
 
@@ -646,8 +662,39 @@ def _smooth(labels, gaps_ok, half=3):
     return out
 
 
-def batch_features(results, mode='both', order='skin', performer=False):
+def file_number(stem):
+    """檔名裡最後一段數字，例如 DSC02921 -> 2921、IMG_9699 -> 9699；沒有數字時回傳 None"""
+    nums = re.findall(r'\d+', stem)
+    return int(nums[-1]) if nums else None
+
+
+def parse_splits(text):
+    """把使用者輸入的分段號碼（例如「2921, 3040 3074」）轉成數字清單"""
+    return sorted({int(x) for x in re.findall(r'\d+', text or '')})
+
+
+def match_splits(ok, splits):
+    """在照時間排好的照片中，找出每個分段號碼對應的位置。
+    完全相同的號碼優先；沒有時用號碼比它大、最接近的那張。回傳 (位置集合, 對不到的號碼)"""
+    nums = [file_number(r['stem']) for r in ok]
+    idx, missing = set(), []
+    for v in splits:
+        exact = [i for i, n in enumerate(nums) if n == v]
+        if exact:
+            idx.add(exact[0])
+            continue
+        bigger = [(n, i) for i, n in enumerate(nums) if n is not None and n > v]
+        if bigger:
+            idx.add(min(bigger)[1])
+        else:
+            missing.append(v)
+    idx.discard(0)
+    return idx, missing
+
+
+def batch_features(results, mode='both', order='skin', performer=False, scene_mode='auto', splits=()):
     """整批照片的挑圖資訊：依拍攝時間排序、切燈光段落、清晰度分數（0~100，整批相對）、每段代表張。
+    scene_mode：'auto' 自動切段；'manual' 只依 splits（檔名號碼，從這張開始新段落）；'both' 兩者都切。
     回傳新的結果清單（照時間排序），每筆多了 scene、rep、sharp_score、uncertain。"""
     rows = [effective(r, performer) for r in results]
     ok = [r for r in rows if not r.get('error')]
@@ -674,9 +721,19 @@ def batch_features(results, mode='both', order='skin', performer=False):
             merged[-1][1] += n
         else:
             merged.append([start, n])
-    seg = []
-    for k, (start, n) in enumerate(merged):
-        seg += [k] * n
+    auto_starts = {start for start, _ in merged}
+    manual_starts, _ = match_splits(ok, splits) if splits else (set(), [])
+    if scene_mode == 'manual':
+        starts = {0} | manual_starts
+    elif scene_mode == 'both':
+        starts = auto_starts | manual_starts
+    else:
+        starts = auto_starts
+    seg, k = [], -1
+    for i in range(len(ok)):
+        if i in starts or i == 0:
+            k += 1
+        seg.append(k)
     out = []
     seq_w = max(4, len(str(len(ok))))
     for i, r in enumerate(ok):
@@ -867,9 +924,19 @@ def build_report(rows, mode='both', order='skin', performer=False):
     noface = n - len(with_face)
     if bad:
         notes.append('⚠ %d 張讀取失敗（表格中紅色列），其他照片不受影響' % len(bad))
+    stage = ok[0].get('stage', 'standard')
     if n >= 10 and pct(white) >= 60:
-        notes.append('⚠ %.0f%% 的照片整體判成白：可能是白光為主或顏色很淡的舞台，'
-                     '可以改用「只看膚色」，或把顏色明顯的段落另外處理' % pct(white))
+        notes.append('⚠ %.0f%% 的照片整體判成白：可能是白光為主或顏色很淡的舞台。可以改用「只看膚色」，'
+                     '或在進階設定把「舞台顏色」改成「淡色舞台」再分析一次比較' % pct(white)
+                     if stage == 'standard' else
+                     '⚠ %.0f%% 的照片整體判成白：已經是「淡色舞台」設定，這批多半真的是白光' % pct(white))
+    if stage == 'pale':
+        warm_faces = sum(r['skin'] in (0, 1) for r in with_face)
+        if len(with_face) >= 5 and warm_faces >= 0.4 * len(with_face):
+            notes.append('⚠ 「淡色舞台」設定下有 %d 張臉被判成紅或橙：膚色本身被當成色光了，建議改回「標準」'
+                         % warm_faces)
+        else:
+            notes.append('ℹ 目前使用「淡色舞台」設定：顏色淡的燈光比較抓得到，但真正的白光場景容易被判成有色')
     if n >= 10 and pct(unc) >= 40:
         if performer:
             notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：已經勾了「整體偏重演出者」仍然偏低，代表打在人身上的光本身就很雜，'
@@ -1131,11 +1198,11 @@ def plan_restore(folder, log_folders=(), recursive=False):
     return plan, by_log
 
 
-def run_analysis(groups, progress=None, workers=None):
+def run_analysis(groups, progress=None, workers=None, stage='standard'):
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     results = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(analyze_group, g) for g in groups]
+        futs = [ex.submit(analyze_group, g, stage) for g in groups]
         for i, f in enumerate(as_completed(futs), 1):
             results.append(f.result())
             if progress:
@@ -1157,7 +1224,7 @@ def run_gui(initial_folder=None):
         pass
     root = tk.Tk()
     root.title('舞台照片色彩分類工具 v%s　© 2026 ting2303・僅限非商業用途' % __version__)
-    root.geometry('1360x760')
+    root.geometry('1180x720')
 
     folder = tk.StringVar()
     recursive = tk.BooleanVar(value=False)
@@ -1168,7 +1235,12 @@ def run_gui(initial_folder=None):
     performer = tk.BooleanVar(value=False)
     time_seq = tk.BooleanVar(value=False)
     sort_by = tk.StringVar(value='time')
-    status = tk.StringVar(value='請選擇照片資料夾')
+    stage = tk.StringVar(value='standard')
+    scene_mode = tk.StringVar(value='auto')
+    splits_text = tk.StringVar(value='')
+    show_all = tk.BooleanVar(value=False)
+    adv_open = tk.BooleanVar(value=False)
+    status = tk.StringVar(value='請選擇照片資料夾，再按「① 分析」')
     state = {'results': [], 'busy': False}
     q = queue.Queue()
 
@@ -1176,10 +1248,45 @@ def run_gui(initial_folder=None):
         refresh_table()
         is_folder = output.get() == 'folder'
         b_apply.configure(text='② 執行分資料夾' if is_folder else '② 執行改名')
-        b_strip.state(['disabled'] if is_folder or state['busy'] else ['!disabled'])
+        m_tools.entryconfig(STRIP_LABEL, state='disabled' if is_folder or state['busy'] else 'normal')
         c_seq.state(['disabled'] if is_folder else ['!disabled'])
 
-    # --- 上方控制列
+    def on_stage():
+        if state['results'] and not state['busy'] and messagebox.askyesno(
+                '重新分析', '改了「舞台顏色」需要重新分析才會生效，要現在開始嗎？'):
+            start_analysis()
+
+    def on_scene():
+        refresh_table()
+        splits = parse_splits(splits_text.get())
+        if scene_mode.get() != 'auto' and state['results'] and splits:
+            ok = sorted([r for r in state['results'] if not r.get('error')],
+                        key=lambda r: (r['time'], r['dir'], r['stem']))
+            _, missing = match_splits(ok, splits)
+            status.set('已依 %d 個號碼分段%s' % (len(splits) - len(missing),
+                       '；找不到：%s' % '、'.join(map(str, missing)) if missing else ''))
+
+    # --- 選單：不常用的工具收在這裡，畫面保持簡潔
+    STRIP_LABEL = '移除所有顏色前綴'
+    menubar = tk.Menu(root)
+    root.config(menu=menubar)
+    m_tools = tk.Menu(menubar, tearoff=0)
+    m_tools.add_command(label='分析報告', command=lambda: do_report())
+    m_tools.add_command(label='燈光時間軸', command=lambda: do_timeline())
+    m_tools.add_command(label='匯出 CSV', command=lambda: do_export())
+    m_tools.add_separator()
+    m_tools.add_command(label='還原修圖後檔名…', command=lambda: do_restore())
+    m_tools.add_command(label=STRIP_LABEL, command=lambda: do_strip())
+    menubar.add_cascade(label='工具', menu=m_tools)
+    m_view = tk.Menu(menubar, tearoff=0)
+    m_view.add_checkbutton(label='顯示進階設定', variable=adv_open, command=lambda: toggle_adv())
+    m_view.add_checkbutton(label='顯示所有欄位', variable=show_all, command=lambda: apply_columns())
+    menubar.add_cascade(label='顯示', menu=m_view)
+    m_help = tk.Menu(menubar, tearoff=0)
+    m_help.add_command(label='欄位與顏色說明', command=lambda: show_help())
+    menubar.add_cascade(label='說明', menu=m_help)
+
+    # --- 基本設定
     top = ttk.Frame(root, padding=8)
     top.pack(fill='x')
     ttk.Label(top, text='資料夾：').pack(side='left')
@@ -1187,62 +1294,101 @@ def run_gui(initial_folder=None):
     ttk.Button(top, text='選擇…', command=lambda: folder.set(filedialog.askdirectory() or folder.get())).pack(side='left')
     ttk.Checkbutton(top, text='包含子資料夾', variable=recursive).pack(side='left', padx=8)
 
-    opts = ttk.Frame(root, padding=(8, 0))
-    opts.pack(fill='x')
-    ttk.Label(opts, text='輸出方式：').pack(side='left')
-    for t, v in (('改檔名', 'rename'), ('分資料夾', 'folder')):
-        ttk.Radiobutton(opts, text=t, value=v, variable=output, command=on_option).pack(side='left')
-    ttk.Label(opts, text='　　依據：').pack(side='left')
+    basic = ttk.Frame(root, padding=(8, 0))
+    basic.pack(fill='x')
+    ttk.Label(basic, text='分類依據：').pack(side='left')
     for t, v in (('膚色＋整體', 'both'), ('只看膚色', 'skin'), ('只看整體', 'main')):
-        ttk.Radiobutton(opts, text=t, value=v, variable=mode, command=on_option).pack(side='left')
-    ttk.Label(opts, text='　　優先：').pack(side='left')
+        ttk.Radiobutton(basic, text=t, value=v, variable=mode, command=on_option).pack(side='left')
+    c_seq = ttk.Checkbutton(basic, text='同色內依拍攝時間排列', variable=time_seq, command=on_option)
+    c_seq.pack(side='left', padx=(18, 0))
+    b_adv = ttk.Button(basic, text='進階設定 ▸', command=lambda: toggle_adv(flip=True))
+    b_adv.pack(side='left', padx=(18, 0))
+
+    # --- 進階設定（預設收起來）
+    adv = ttk.LabelFrame(root, text='進階設定', padding=(8, 4))
+    a1 = ttk.Frame(adv)
+    a1.pack(fill='x')
+    ttk.Label(a1, text='輸出方式：').pack(side='left')
+    for t, v in (('改檔名', 'rename'), ('分資料夾', 'folder')):
+        ttk.Radiobutton(a1, text=t, value=v, variable=output, command=on_option).pack(side='left')
+    ttk.Label(a1, text='　優先：').pack(side='left')
     for t, v in (('膚色', 'skin'), ('整體', 'main')):
-        ttk.Radiobutton(opts, text=t, value=v, variable=order, command=on_option).pack(side='left')
-    ttk.Checkbutton(opts, text='加排序數字', variable=digits, command=on_option).pack(side='left', padx=12)
-
-    opts2 = ttk.Frame(root, padding=(8, 4, 8, 0))
-    opts2.pack(fill='x')
-    ttk.Checkbutton(opts2, text='整體偏重演出者（背景 LED 螢幕很花時勾選）', variable=performer,
-                    command=on_option).pack(side='left')
-    c_seq = ttk.Checkbutton(opts2, text='同色內依拍攝時間排列（檔名加時間序號，例：8粉_0012_）',
-                            variable=time_seq, command=on_option)
-    c_seq.pack(side='left', padx=(16, 0))
-    ttk.Label(opts2, text='　　表格排序：').pack(side='left')
+        ttk.Radiobutton(a1, text=t, value=v, variable=order, command=on_option).pack(side='left')
+    ttk.Checkbutton(a1, text='加排序數字', variable=digits, command=on_option).pack(side='left', padx=10)
+    ttk.Checkbutton(a1, text='整體偏重演出者（背景 LED 螢幕很花時）', variable=performer,
+                    command=on_option).pack(side='left', padx=10)
+    a2 = ttk.Frame(adv)
+    a2.pack(fill='x', pady=(4, 0))
+    ttk.Label(a2, text='舞台顏色：').pack(side='left')
+    for v in ('standard', 'pale'):
+        ttk.Radiobutton(a2, text=STAGE_NAMES[v], value=v, variable=stage, command=on_stage).pack(side='left')
+    ttk.Label(a2, text='　表格排序：').pack(side='left')
     for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人物', 'person'), ('星等', 'stars')):
-        ttk.Radiobutton(opts2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
+        ttk.Radiobutton(a2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
+    a3 = ttk.Frame(adv)
+    a3.pack(fill='x', pady=(4, 0))
+    ttk.Label(a3, text='燈光段落：').pack(side='left')
+    for t, v in (('自動', 'auto'), ('手動', 'manual'), ('自動＋手動', 'both')):
+        ttk.Radiobutton(a3, text=t, value=v, variable=scene_mode, command=on_scene).pack(side='left')
+    ttk.Label(a3, text='　從這些檔名號碼開始新段落：').pack(side='left')
+    e_split = ttk.Entry(a3, textvariable=splits_text, width=32)
+    e_split.pack(side='left')
+    e_split.bind('<Return>', lambda e: on_scene())
+    ttk.Button(a3, text='套用', command=on_scene).pack(side='left', padx=4)
+    ttk.Label(a3, text='例：2921, 3040, 3074', foreground='#777').pack(side='left', padx=6)
 
-    ttk.Label(root, padding=(8, 4), foreground='#555',
-              text='顏色：0白(白光/自然膚色) 1紅 2橙 3黃 4綠 5青 6藍 7紫 8粉 9暗 無(沒偵測到臉)'
-                   '　｜　改檔名例：6藍7紫_原檔名 → 前面是優先項目，後面是另一項'
-                   '\n段落：照拍攝時間切開的同燈光區段　★：該段代表張（先修這張再同步）　'
-                   '清晰度：整批相對分數 0~100　?：主色票數偏低，建議人工確認'
-                   '\n星等：整批相對初篩　人物：同一人歸同一組（P1 照片最多）　亮度：和同一人最亮的照片比　'
-                   '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案').pack(fill='x')
+    legend = ttk.Label(root, padding=(8, 4), foreground='#555',
+                       text='顏色：0白 1紅 2橙 3黃 4綠 5青 6藍 7紫 8粉 9暗　｜　代表 ★：每段先修這張，再同步給整段　｜　'
+                            '其他欄位說明在選單「說明」')
+    legend.pack(fill='x')
+
+    def toggle_adv(flip=False):
+        if flip:
+            adv_open.set(not adv_open.get())
+        if adv_open.get():
+            adv.pack(fill='x', padx=8, pady=(4, 0), before=legend)
+            b_adv.configure(text='進階設定 ▾')
+        else:
+            adv.pack_forget()
+            b_adv.configure(text='進階設定 ▸')
+
+    def show_help():
+        messagebox.showinfo('欄位與顏色說明',
+                            '顏色：0白(白光/自然膚色) 1紅 2橙 3黃 4綠 5青 6藍 7紫 8粉 9暗 無(沒偵測到臉)\n'
+                            '改檔名例：6藍7紫_原檔名 → 前面是優先項目，後面是另一項\n\n'
+                            '段落：照拍攝時間切開的同燈光區段；進階設定可以手動輸入檔名號碼分段\n'
+                            '代表 ★：每段最適合先修的一張\n'
+                            '星等：整批相對初篩（1 星 = 沒有臉、太暗或可能模糊）\n'
+                            '人物：同一人歸同一組（P1 照片最多），只比對臉像不像，不辨識是誰\n\n'
+                            '「顯示 → 顯示所有欄位」還有：\n'
+                            '清晰度：整批相對分數 0~100\n'
+                            '亮度：和同一人最亮的照片比\n'
+                            '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案\n'
+                            '整體後的 ?：主色票數偏低，建議人工確認\n'
+                            '燈光爆點：很亮又沒顏色的部分（不參與投票）佔亮處的比例\n'
+                            '時間後的 *：沒有拍攝時間，改用檔案時間')
 
     btns = ttk.Frame(root, padding=8)
     btns.pack(fill='x')
     b_analyze = ttk.Button(btns, text='① 分析（預覽，不動檔案）', command=lambda: start_analysis())
     b_apply = ttk.Button(btns, text='② 執行改名', command=lambda: do_apply())
     b_undo = ttk.Button(btns, text='復原上一次', command=lambda: do_undo())
-    b_strip = ttk.Button(btns, text='移除所有顏色前綴', command=lambda: do_strip())
-    b_csv = ttk.Button(btns, text='匯出 CSV', command=lambda: do_export())
-    b_restore = ttk.Button(btns, text='還原修圖後檔名', command=lambda: do_restore())
-    b_timeline = ttk.Button(btns, text='燈光時間軸', command=lambda: do_timeline())
     b_report = ttk.Button(btns, text='分析報告', command=lambda: do_report())
-    for b in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore, b_timeline, b_report):
+    for b in (b_analyze, b_apply, b_undo, b_report):
         b.pack(side='left', padx=4)
     pbar = ttk.Progressbar(btns, length=250)
     pbar.pack(side='right')
 
-    # --- 預覽表格
+    # --- 預覽表格：預設只顯示挑圖最常用的欄位
     cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'person', 'bright', 'wb', 'faces', 'skin', 'skin_r',
             'main', 'main_r', 'top', 'hl', 'new')
     heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '臉數', '膚色', '膚色比例',
              '整體', '整體比例', '整體組成', '燈光爆點', '結果')
     widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 40, 45, 65, 50, 65, 160, 65, 300)
+    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'skin', 'main', 'new')
     frame = ttk.Frame(root)
     frame.pack(fill='both', expand=True, padx=8)
-    tree = ttk.Treeview(frame, columns=cols, show='headings')
+    tree = ttk.Treeview(frame, columns=cols, show='headings', displaycolumns=basic_cols)
     for c, hd, w in zip(cols, heads, widths):
         tree.heading(c, text=hd)
         tree.column(c, width=w, anchor='w')
@@ -1258,18 +1404,25 @@ def run_gui(initial_folder=None):
         tree.tag_configure('c%d' % i, background=c)
     tree.tag_configure('err', background='#ffdddd', foreground='#a00')
 
+    def apply_columns():
+        tree.configure(displaycolumns='#all' if show_all.get() else basic_cols)
+
     ttk.Label(root, textvariable=status, padding=8).pack(fill='x')
 
     def set_busy(b):
         state['busy'] = b
-        for w in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore, b_timeline, b_report):
+        for w in (b_analyze, b_apply, b_undo, b_report):
             w.state(['disabled'] if b else ['!disabled'])
+        for i in range(m_tools.index('end') + 1):
+            if m_tools.type(i) == 'command':
+                m_tools.entryconfig(i, state='disabled' if b else 'normal')
         if not b and output.get() == 'folder':
-            b_strip.state(['disabled'])
+            m_tools.entryconfig(STRIP_LABEL, state='disabled')
 
     def current_rows():
         """套用目前選項後的結果（含挑圖資訊），依表格排序方式排好"""
-        rows = batch_features(state['results'], mode.get(), order.get(), performer.get())
+        rows = batch_features(state['results'], mode.get(), order.get(), performer.get(),
+                              scene_mode.get(), parse_splits(splits_text.get()))
         sk = slot_order(mode.get(), order.get())
         if sort_by.get() == 'name':
             rows.sort(key=lambda r: (r['dir'], r['stem']))
@@ -1326,11 +1479,11 @@ def run_gui(initial_folder=None):
         set_busy(True)
         pbar['maximum'] = len(groups)
         pbar['value'] = 0
-        status.set('分析中… 共 %d 張' % len(groups))
+        status.set('分析中… 共 %d 張%s' % (len(groups), '（淡色舞台設定）' if stage.get() == 'pale' else ''))
 
         def worker():
             try:
-                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)))
+                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)), stage=stage.get())
                 q.put(('done', res))
             except Exception as e:
                 q.put(('fail', str(e)))
@@ -1572,6 +1725,11 @@ def run_cli(argv):
     ap.add_argument('--performer', action='store_true', help='整體偏重演出者（背景 LED 螢幕很花時使用）')
     ap.add_argument('--csv', metavar='PATH', help='把分析結果（含挑圖資訊）存成 CSV')
     ap.add_argument('--time-seq', action='store_true', help='同色內依拍攝時間排列（檔名加時間序號）')
+    ap.add_argument('--stage', choices=list(STAGE_PRESETS), default='standard',
+                    help='舞台顏色：standard 標準、pale 淡色舞台（顏色很淡時用，白光場景容易被判成有色）')
+    ap.add_argument('--scenes', choices=['auto', 'manual', 'both'], default='auto',
+                    help='燈光段落：auto 自動、manual 只依 --splits、both 兩者都切')
+    ap.add_argument('--splits', default='', metavar='號碼', help='從這些檔名號碼開始新段落，例如 "2921,3040,3074"')
     ap.add_argument('--report', nargs='?', const='-', metavar='PATH',
                     help='印出分析報告；給檔名則另外存成文字檔')
     ap.add_argument('--restore', action='store_true', help='還原修圖輸出後的檔名（移除本工具加的前綴）')
@@ -1595,9 +1753,15 @@ def run_cli(argv):
         return
     groups = collect_groups(a.folder, a.recursive)
     print('共 %d 張，分析中…' % len(groups))
-    results = run_analysis(groups, progress=lambda i, n: print('\r%d/%d' % (i, n), end='', flush=True))
+    results = run_analysis(groups, progress=lambda i, n: print('\r%d/%d' % (i, n), end='', flush=True), stage=a.stage)
     print()
-    rows = batch_features(results, a.mode, a.order, a.performer)
+    splits = parse_splits(a.splits)
+    rows = batch_features(results, a.mode, a.order, a.performer, a.scenes, splits)
+    if splits and a.scenes != 'auto':
+        ok = [r for r in rows if not r.get('error')]
+        missing = match_splits(ok, splits)[1]
+        if missing:
+            print('找不到這些分段號碼：%s' % '、'.join(map(str, missing)))
     for r in rows:
         if r.get('error'):
             print('[錯誤] %s：%s' % (r['source'], r['error']))
