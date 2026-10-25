@@ -25,7 +25,8 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
   圖形介面：  python photo_color_sorter.py [資料夾]
   命令列：    python photo_color_sorter.py <資料夾> --preview|--apply [--output rename|folder]
               [--mode both|skin|main] [--order skin|main] [--no-digits] [-r]
-              [--performer] [--csv 結果.csv]
+              [--performer] [--csv 結果.csv] [--time-seq]
+  還原修圖後檔名：python photo_color_sorter.py <輸出資料夾> --restore [--log-folder 原始資料夾] [--apply]
 """
 import os
 import re
@@ -95,7 +96,8 @@ SKIN_NATURAL_S = 0.62     # 膚色：在膚色色相範圍內且飽和度低於�
 SKIN_NATURAL_HUE = (5, 40)
 
 _COLOR_CHARS = ''.join(c[1] for c in CATEGORIES)
-PREFIX_RE = re.compile(r'^(?:(?:\d?[%s]){1,2}_|(?:[SM]\d{2}[^_]*_){1,2}_)' % _COLOR_CHARS)  # 新格式 | 舊版長格式
+# 新格式（可帶時間序號，例如 8粉_0012_）| 舊版長格式
+PREFIX_RE = re.compile(r'^(?:(?:\d?[%s]){1,2}_(?:\d{4,6}_)?|(?:[SM]\d{2}[^_]*_){1,2}_)' % _COLOR_CHARS)
 FOLDER_RE = re.compile(r'^(?:膚色|整體)\d?[%s]$' % _COLOR_CHARS)
 LOG_PREFIX = '_色彩分類紀錄_'
 PHOTO_EXTS = RAW_EXTS | IMG_EXTS | SIDECAR_EXTS
@@ -579,8 +581,9 @@ def batch_features(results, mode='both', order='skin', performer=False):
     for k, (start, n) in enumerate(merged):
         seg += [k] * n
     out = []
+    seq_w = max(4, len(str(len(ok))))
     for i, r in enumerate(ok):
-        out.append(dict(r, scene=seg[i] + 1,
+        out.append(dict(r, scene=seg[i] + 1, seq=i + 1, seq_w=seq_w,
                         sharp_score=int(round(100 * ranks[i] / max(len(ok) - 1, 1))) if len(ok) > 1 else 100,
                         uncertain=r['main_ratio'] < UNCERTAIN_RATIO, rep=False))
     # 每段代表張：清晰度 50% + 臉的大小 25% + 臉部亮度接近中間 25%；有臉的照片優先
@@ -598,7 +601,7 @@ def batch_features(results, mode='both', order='skin', performer=False):
     return out + bad
 
 
-def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename'):
+def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False):
     """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟"""
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
@@ -610,7 +613,7 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
                 continue
             clean = strip_prefix(r['source'])
             new = (os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
-                   else build_prefix(r, mode, order, digits) + clean)
+                   else build_prefix(r, mode, order, digits, time_seq) + clean)
             wr.writerow([r['source'], r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
                          'S%02d' % r['scene'], '★' if r['rep'] else '', r['sharp_score'], r['faces'],
                          label(r['skin']), '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
@@ -637,9 +640,13 @@ def slot_order(mode='both', order='skin'):
     return ['skin', 'main'] if order == 'skin' else ['main', 'skin']
 
 
-def build_prefix(res, mode='both', order='skin', digits=True):
-    """檔名前綴，例如 6藍7紫_（前 = 排序優先的那一項）"""
-    return ''.join(tag(res[k], digits) for k in slot_order(mode, order)) + '_'
+def build_prefix(res, mode='both', order='skin', digits=True, time_seq=False):
+    """檔名前綴，例如 6藍7紫_（前 = 排序優先的那一項）。
+    time_seq=True 時再加拍攝時間序號，例如 8粉_0012_：同色的照片照拍攝時間排，不受原檔名編號影響"""
+    p = ''.join(tag(res[k], digits) for k in slot_order(mode, order)) + '_'
+    if time_seq and res.get('seq'):
+        p += '%0*d_' % (res.get('seq_w', 4), res['seq'])
+    return p
 
 
 def build_subdir(res, mode='both', order='skin', digits=True):
@@ -648,8 +655,9 @@ def build_subdir(res, mode='both', order='skin', digits=True):
     return os.path.join(*[names[k] + tag(res[k], digits) for k in slot_order(mode, order)])
 
 
-def plan_renames(results, mode='both', order='skin', digits=True, output='rename'):
-    """回傳 [(舊完整路徑, 新完整路徑)]。output='rename' 改檔名，'folder' 移到顏色子資料夾"""
+def plan_renames(results, mode='both', order='skin', digits=True, output='rename', time_seq=False):
+    """回傳 [(舊完整路徑, 新完整路徑)]。output='rename' 改檔名，'folder' 移到顏色子資料夾。
+    time_seq 需要 batch_features 算好的 seq（拍攝時間順序），只用於改檔名"""
     plan = []
     for r in results:
         if r.get('error'):
@@ -659,7 +667,7 @@ def plan_renames(results, mode='both', order='skin', digits=True, output='rename
             if output == 'folder':
                 new = os.path.join(r['dir'], build_subdir(r, mode, order, digits), clean)
             else:
-                new = os.path.join(r['dir'], build_prefix(r, mode, order, digits) + clean)
+                new = os.path.join(r['dir'], build_prefix(r, mode, order, digits, time_seq) + clean)
             old = os.path.join(r['dir'], f)
             if new != old:
                 plan.append((old, new))
@@ -757,6 +765,61 @@ def strip_all_prefixes(folder, recursive=False):
     return plan
 
 
+def _log_mappings(folders):
+    """從改名紀錄讀出 {改名後的主檔名: 原本的主檔名}（只取「改檔名」的紀錄，分資料夾的沒有改名）"""
+    mapping = {}
+    for d in folders:
+        if not d or not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if not (f.startswith((LOG_PREFIX, '_色彩改名紀錄_')) and f.endswith('.csv')):
+                continue
+            try:
+                with open(os.path.join(d, f), newline='', encoding='utf-8-sig') as fp:
+                    for row in csv.DictReader(fp):
+                        old, new = row.get('old'), row.get('new')
+                        if not old or not new:
+                            continue
+                        if os.path.dirname(os.path.abspath(old)) != os.path.dirname(os.path.abspath(new)):
+                            continue
+                        o, n = file_stem(os.path.basename(old)), file_stem(os.path.basename(new))
+                        if o != n:
+                            mapping[n] = o
+            except Exception:
+                continue  # 讀不了的紀錄檔就略過
+    # 執行過好幾次時，紀錄是「第二次的名字 → 第一次的名字」；和改名時一樣移除前綴，就回到最原始的名字
+    return {n: strip_prefix(o) for n, o in mapping.items()}
+
+
+def plan_restore(folder, log_folders=(), recursive=False):
+    """修圖輸出後還原原本的檔名，例如
+         8粉_0012_DSC02921-Enhanced-NR.jpg  ->  DSC02921-Enhanced-NR.jpg
+    先比對改名紀錄（所選資料夾，以及原始照片所在的資料夾）：檔名開頭是當初改出來的名字，
+    就換回原本的名字，後面修圖軟體加的字照樣保留。找得到紀錄時只動紀錄裡的照片，
+    其他檔案（例如自己取名的 白_婚禮.jpg）不碰；完全沒有紀錄時，才用前綴規則移除顏色前綴。
+    回傳 ([(舊路徑, 新路徑)], 依紀錄還原的數量)"""
+    mapping = _log_mappings([folder] + list(log_folders))
+    keys = sorted(mapping, key=len, reverse=True)  # 最長的先比，避免 DSC_1 搶走 DSC_10
+    plan, by_log = [], 0
+    for d, names in walk_photos(folder, recursive):
+        for n in names:
+            if os.path.splitext(n)[1].lower() not in PHOTO_EXTS:
+                continue
+            new = None
+            for k in keys:
+                if n.startswith(k):
+                    new = mapping[k] + n[len(k):]
+                    by_log += 1
+                    break
+            if new is None:
+                if mapping:
+                    continue  # 有紀錄但對不上：不是本工具改過的，不碰
+                new = strip_prefix(n)
+            if new != n:
+                plan.append((os.path.join(d, n), os.path.join(d, new)))
+    return plan, by_log
+
+
 def run_analysis(groups, progress=None, workers=None):
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     results = []
@@ -792,6 +855,7 @@ def run_gui(initial_folder=None):
     order = tk.StringVar(value='skin')
     digits = tk.BooleanVar(value=True)
     performer = tk.BooleanVar(value=False)
+    time_seq = tk.BooleanVar(value=False)
     sort_by = tk.StringVar(value='time')
     status = tk.StringVar(value='請選擇照片資料夾')
     state = {'results': [], 'busy': False}
@@ -802,6 +866,7 @@ def run_gui(initial_folder=None):
         is_folder = output.get() == 'folder'
         b_apply.configure(text='② 執行分資料夾' if is_folder else '② 執行改名')
         b_strip.state(['disabled'] if is_folder or state['busy'] else ['!disabled'])
+        c_seq.state(['disabled'] if is_folder else ['!disabled'])
 
     # --- 上方控制列
     top = ttk.Frame(root, padding=8)
@@ -828,6 +893,9 @@ def run_gui(initial_folder=None):
     opts2.pack(fill='x')
     ttk.Checkbutton(opts2, text='整體偏重演出者（背景 LED 螢幕很花時勾選）', variable=performer,
                     command=on_option).pack(side='left')
+    c_seq = ttk.Checkbutton(opts2, text='同色內依拍攝時間排列（檔名加時間序號，例：8粉_0012_）',
+                            variable=time_seq, command=on_option)
+    c_seq.pack(side='left', padx=(16, 0))
     ttk.Label(opts2, text='　　表格排序：').pack(side='left')
     for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color')):
         ttk.Radiobutton(opts2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
@@ -845,7 +913,8 @@ def run_gui(initial_folder=None):
     b_undo = ttk.Button(btns, text='復原上一次', command=lambda: do_undo())
     b_strip = ttk.Button(btns, text='移除所有顏色前綴', command=lambda: do_strip())
     b_csv = ttk.Button(btns, text='匯出 CSV', command=lambda: do_export())
-    for b in (b_analyze, b_apply, b_undo, b_strip, b_csv):
+    b_restore = ttk.Button(btns, text='還原修圖後檔名', command=lambda: do_restore())
+    for b in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore):
         b.pack(side='left', padx=4)
     pbar = ttk.Progressbar(btns, length=250)
     pbar.pack(side='right')
@@ -873,7 +942,7 @@ def run_gui(initial_folder=None):
 
     def set_busy(b):
         state['busy'] = b
-        for w in (b_analyze, b_apply, b_undo, b_strip, b_csv):
+        for w in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore):
             w.state(['disabled'] if b else ['!disabled'])
         if not b and output.get() == 'folder':
             b_strip.state(['disabled'])
@@ -886,7 +955,7 @@ def run_gui(initial_folder=None):
             rows.sort(key=lambda r: (r['dir'], r['stem']))
         elif sort_by.get() == 'color':
             rows.sort(key=lambda r: (1, r['source']) if r.get('error') else
-                      (0, build_prefix(r, mode.get(), order.get(), True), r['time']))
+                      (0, build_prefix(r, mode.get(), order.get(), True, time_seq.get()), r['time']))
         return rows, sk[0]
 
     def refresh_table():
@@ -901,7 +970,7 @@ def run_gui(initial_folder=None):
             if output.get() == 'folder':
                 new = os.path.join(build_subdir(r, mode.get(), order.get(), digits.get()), clean)
             else:
-                new = build_prefix(r, mode.get(), order.get(), digits.get()) + clean
+                new = build_prefix(r, mode.get(), order.get(), digits.get(), time_seq.get()) + clean
             extra = len(r['files']) - 1
             if extra:
                 new += '  (+%d 個同名檔)' % extra
@@ -971,8 +1040,8 @@ def run_gui(initial_folder=None):
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
         is_folder = output.get() == 'folder'
-        plan = plan_renames([effective(r, performer.get()) for r in state['results']],
-                            mode.get(), order.get(), digits.get(), output.get())
+        rows, _ = current_rows()  # 已套用「偏重演出者」並算好拍攝時間序號
+        plan = plan_renames(rows, mode.get(), order.get(), digits.get(), output.get(), time_seq.get())
         if not plan:
             messagebox.showinfo('提示', '沒有需要處理的檔案')
             return
@@ -1026,7 +1095,7 @@ def run_gui(initial_folder=None):
             path = os.path.join(f, '_色彩分析_%s_%d.csv' % (stamp, k))
         try:
             rows, _ = current_rows()
-            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get())
+            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get(), time_seq.get())
         except Exception as e:
             messagebox.showerror('無法匯出', str(e))
             return
@@ -1046,6 +1115,37 @@ def run_gui(initial_folder=None):
         done, errors, _ = apply_renames(plan, f)
         status.set('已移除 %d 個檔案的前綴' % len(done))
         messagebox.showinfo('完成', '已移除 %d 個檔案的前綴' % len(done) + ('\n%d 個失敗' % len(errors) if errors else ''))
+
+    def do_restore():
+        f = check_folder()
+        if not f:
+            return
+        extra = []
+        if messagebox.askyesno('還原修圖後檔名',
+                               '把修圖輸出的照片改回原本的檔名，例如\n'
+                               '8粉_0012_DSC02921-Enhanced-NR.jpg → DSC02921-Enhanced-NR.jpg\n\n'
+                               '輸出的照片和原始照片放在不同資料夾嗎？\n'
+                               '選「是」會再請你選原始照片的資料夾（裡面有改名紀錄，比對最準確）。'):
+            d = filedialog.askdirectory(title='選擇原始照片所在的資料夾')
+            if d:
+                extra.append(d)
+        plan, by_log = plan_restore(f, extra, recursive.get())
+        if not plan:
+            messagebox.showinfo('提示', '沒有找到需要還原的檔名')
+            return
+        sample = '\n'.join('%s → %s' % (os.path.basename(a), os.path.basename(b)) for a, b in plan[:3])
+        how = '（%d 個依改名紀錄比對，%d 個依顏色前綴規則）' % (by_log, len(plan) - by_log)
+        if not messagebox.askyesno('確認', '要還原 %d 個檔案的檔名嗎？%s\n\n%s%s\n\n之後可以按「復原上一次」改回來。'
+                                   % (len(plan), how, sample, '\n…' if len(plan) > 3 else '')):
+            return
+        done, errors, log = apply_renames(plan, f)
+        state['results'] = []
+        refresh_table()
+        status.set('已還原 %d 個檔案的檔名' % len(done))
+        msg = '已還原 %d 個檔案的檔名。' % len(done)
+        if errors:
+            msg += '\n\n%d 個失敗：\n' % len(errors) + '\n'.join('%s：%s' % (os.path.basename(a), b) for a, b in errors[:10])
+        messagebox.showinfo('完成', msg)
 
     poll()
     if initial_folder:
@@ -1068,11 +1168,26 @@ def run_cli(argv):
     ap.add_argument('-r', '--recursive', action='store_true')
     ap.add_argument('--performer', action='store_true', help='整體偏重演出者（背景 LED 螢幕很花時使用）')
     ap.add_argument('--csv', metavar='PATH', help='把分析結果（含挑圖資訊）存成 CSV')
+    ap.add_argument('--time-seq', action='store_true', help='同色內依拍攝時間排列（檔名加時間序號）')
+    ap.add_argument('--restore', action='store_true', help='還原修圖輸出後的檔名（移除本工具加的前綴）')
+    ap.add_argument('--log-folder', action='append', default=[], metavar='DIR',
+                    help='搭配 --restore：原始照片所在的資料夾（讀它的改名紀錄），可指定多次')
     a = ap.parse_args(argv)
 
     if not os.path.isdir(a.folder):
         print('找不到資料夾：%s' % a.folder)
         sys.exit(2)
+    if a.restore:
+        plan, by_log = plan_restore(a.folder, a.log_folder, a.recursive)
+        print('找到 %d 個要還原的檔名（%d 個依改名紀錄，%d 個依前綴規則）' % (len(plan), by_log, len(plan) - by_log))
+        for old, new in plan:
+            print('  %s -> %s' % (os.path.basename(old), os.path.basename(new)))
+        if a.apply:
+            done, errors, log = apply_renames(plan, a.folder)
+            print('已還原 %d 個，失敗 %d 個，紀錄：%s' % (len(done), len(errors), log))
+        else:
+            print('（預覽模式，加上 --apply 才會執行）')
+        return
     groups = collect_groups(a.folder, a.recursive)
     print('共 %d 張，分析中…' % len(groups))
     results = run_analysis(groups, progress=lambda i, n: print('\r%d/%d' % (i, n), end='', flush=True))
@@ -1088,9 +1203,9 @@ def run_cli(argv):
                 r['skin_ratio'] * 100, label(r['main']), '?' if r['uncertain'] else '', r['main_ratio'] * 100,
                 r.get('highlight', 0) * 100))
     if a.csv:
-        export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output)
+        export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
         print('已匯出 CSV：%s' % a.csv)
-    plan = plan_renames(rows, a.mode, a.order, not a.no_digits, a.output)
+    plan = plan_renames(rows, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
     for old, new in plan:
         print('  %s -> %s' % (os.path.basename(old), os.path.relpath(new, os.path.dirname(old))))
     if a.apply:

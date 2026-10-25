@@ -322,3 +322,124 @@ class StabilityTests(unittest.TestCase):
         self.assertIn('A.jpg', names)
         self.assertEqual(len([n for n in names if '已復原' in n]), 2)
         self.assertIsNone(pcs.latest_log(self.dir))
+
+
+class TimeSeqAndRestoreTests(unittest.TestCase):
+    """同色內依拍攝時間排列、修圖輸出後還原檔名"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write(self, folder, name, color, when=None):
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, name)
+        if when:
+            with open(path, 'wb') as fp:
+                fp.write(jpeg_with_exif(solid(color), tiff_exif(when, '0')))
+        else:
+            save(path, solid(color))
+        return path
+
+    def test_strip_prefix_with_time_seq(self):
+        self.assertEqual(pcs.strip_prefix('8粉_0012_DSC02921.ARW'), 'DSC02921.ARW')
+        self.assertEqual(pcs.strip_prefix('8粉6藍_0012_DSC02921-Enhanced-NR.jpg'), 'DSC02921-Enhanced-NR.jpg')
+        self.assertEqual(pcs.strip_prefix('粉藍_00012_A.jpg'), 'A.jpg')
+        self.assertEqual(pcs.strip_prefix('8粉_12_A.jpg'), '12_A.jpg')  # 兩位數不是時間序號
+        self.assertEqual(pcs.strip_prefix('藍天白雲_A.JPG'), '藍天白雲_A.JPG')
+
+    def test_time_seq_orders_by_capture_time_not_number(self):
+        """兩台相機：編號大的反而先拍。加時間序號後，同色內依拍攝時間排"""
+        self.write(self.dir, 'CAM2_9999.jpg', (255, 0, 0), '2026:06:20 19:00:00')
+        self.write(self.dir, 'CAM1_0001.jpg', (255, 0, 0), '2026:06:20 19:00:30')
+        self.write(self.dir, 'CAM1_0002.jpg', (0, 0, 255), '2026:06:20 19:01:00')
+        res = [pcs.analyze_group(g) for g in pcs.collect_groups(self.dir)]
+        rows = pcs.batch_features(res, 'main', 'main')
+        plan = pcs.plan_renames(rows, 'main', 'main', True, 'rename', time_seq=True)
+        new = sorted(os.path.basename(b) for _, b in plan)
+        self.assertEqual(new, ['1紅_0003_CAM1_0002.jpg', '6藍_0001_CAM2_9999.jpg', '6藍_0002_CAM1_0001.jpg'])
+        plain = pcs.plan_renames(rows, 'main', 'main', True, 'rename')  # 沒勾選時格式不變
+        self.assertIn('6藍_CAM2_9999.jpg', [os.path.basename(b) for _, b in plain])
+
+    def run_tool(self, folder, mode='skin', time_seq=True):
+        res = [pcs.analyze_group(g) for g in pcs.collect_groups(folder)]
+        rows = pcs.batch_features(res, mode, 'skin')
+        done, errors, log = pcs.apply_renames(pcs.plan_renames(rows, mode, 'skin', True, 'rename', time_seq), folder)
+        self.assertEqual(errors, [])
+        return {os.path.basename(a): os.path.basename(b) for a, b in done}
+
+    def test_restore_exported_jpgs(self):
+        """ARW 改名 → 修圖 → 輸出 JPG（後綴不同）→ 還原成原本的檔名"""
+        orig, out = os.path.join(self.dir, 'orig'), os.path.join(self.dir, 'export')
+        self.write(orig, 'DSC02921.jpg', (255, 0, 0), '2026:06:20 19:00:00')
+        self.write(orig, 'DSC02938.jpg', (255, 0, 0), '2026:06:20 19:00:10')
+        self.write(orig, 'DSC0293.jpg', (255, 0, 0), '2026:06:20 19:00:20')  # 名字是別人的開頭
+        renamed = self.run_tool(orig)
+        os.makedirs(out)
+        exported = {}
+        for o, n in renamed.items():
+            stem = os.path.splitext(n)[0]
+            for suffix in ('-Enhanced-NR.jpg', '_edit.jpg'):
+                self.write(out, stem + suffix, (128, 128, 128))
+                exported[stem + suffix] = os.path.splitext(o)[0] + suffix
+        plan, by_log = pcs.plan_restore(out, [orig])
+        self.assertEqual(by_log, len(exported))
+        self.assertEqual({os.path.basename(a): os.path.basename(b) for a, b in plan}, exported)
+        # 沒有紀錄時用前綴規則，結果相同
+        plan2, by_log2 = pcs.plan_restore(out)
+        self.assertEqual(by_log2, 0)
+        self.assertEqual({os.path.basename(a): os.path.basename(b) for a, b in plan2}, exported)
+        # 執行後可以用「復原上一次」改回來
+        done, errors, log = pcs.apply_renames(plan, out)
+        self.assertEqual((len(done), errors), (len(exported), []))
+        self.assertEqual(sorted(os.listdir(out)), sorted(list(exported.values()) + [os.path.basename(log)]))
+        pcs.undo_log(log)
+        self.assertEqual(sorted(n for n in os.listdir(out) if not n.startswith('_')), sorted(exported))
+
+    def test_restore_after_running_twice(self):
+        """執行兩次（第二次換了分類方式）後輸出的照片，也要還原成最原始的名字"""
+        orig = os.path.join(self.dir, 'orig')
+        self.write(orig, 'DSC1.jpg', (255, 0, 0), '2026:06:20 19:00:00')
+        self.run_tool(orig, mode='skin')
+        second = self.run_tool(orig, mode='main')
+        stem = os.path.splitext(list(second.values())[0])[0]
+        out = os.path.join(self.dir, 'export')
+        self.write(out, stem + ' (1).jpg', (0, 0, 0))
+        plan, by_log = pcs.plan_restore(out, [orig])
+        self.assertEqual([os.path.basename(b) for _, b in plan], ['DSC1 (1).jpg'])
+        self.assertEqual(by_log, 1)
+
+    def test_restore_never_overwrites(self):
+        out = os.path.join(self.dir, 'export')
+        self.write(out, '6藍_0001_DSC1.jpg', (0, 0, 0))
+        self.write(out, 'DSC1.jpg', (0, 0, 0))  # 目標名稱已存在
+        plan, _ = pcs.plan_restore(out)
+        done, errors, _ = pcs.apply_renames(plan, out)
+        self.assertEqual((len(done), len(errors)), (0, 1))
+        self.assertEqual(sorted(os.listdir(out)), ['6藍_0001_DSC1.jpg', 'DSC1.jpg'])
+
+    def test_restore_with_log_leaves_other_files(self):
+        """有改名紀錄時，只還原紀錄裡的照片；自己取名的「白_婚禮.jpg」不能被動到"""
+        orig, out = os.path.join(self.dir, 'orig'), os.path.join(self.dir, 'export')
+        self.write(orig, 'DSC1.jpg', (255, 0, 0))
+        renamed = self.run_tool(orig, time_seq=False)
+        self.write(out, os.path.splitext(renamed['DSC1.jpg'])[0] + '-edit.jpg', (0, 0, 0))
+        self.write(out, '白_婚禮.jpg', (0, 0, 0))
+        plan, by_log = pcs.plan_restore(out, [orig])
+        self.assertEqual([os.path.basename(b) for _, b in plan], ['DSC1-edit.jpg'])
+        self.assertEqual(by_log, 1)
+
+    def test_restore_longest_match_first(self):
+        """紀錄裡有 8粉_DSC_1 和 8粉_DSC_10 時，8粉_DSC_10-edit.jpg 要還原成 DSC_10-edit.jpg"""
+        orig, out = os.path.join(self.dir, 'orig'), os.path.join(self.dir, 'export')
+        self.write(orig, 'DSC_1.jpg', (255, 0, 0))
+        self.write(orig, 'DSC_10.jpg', (255, 0, 0))
+        self.run_tool(orig, time_seq=False)
+        renamed = sorted(n for n in os.listdir(orig) if not n.startswith('_'))
+        for n in renamed:
+            self.write(out, os.path.splitext(n)[0] + '-edit.jpg', (0, 0, 0))
+        plan, by_log = pcs.plan_restore(out, [orig])
+        self.assertEqual(sorted(os.path.basename(b) for _, b in plan), ['DSC_1-edit.jpg', 'DSC_10-edit.jpg'])
+        self.assertEqual(by_log, 2)

@@ -64,6 +64,7 @@ The digits exist only for sorting: Lightroom sorts 0 → 9, so white light comes
 | 優先 (Priority) | Whether the face or overall color comes first, i.e. which one groups the sort |
 | 加排序數字 (Sort digits) | Turn off for shorter names like `粉藍_`; same colors still group together, just not in rainbow order |
 | 包含子資料夾 (Subfolders) | Include subfolders; color folders created by the tool are skipped |
+| 同色內依拍攝時間排列 (Time order within a color) | Adds a capture-time sequence number after the color (e.g. `8粉_0012_DSC02921.ARW`), so photos of one color always sort by capture time, even with two cameras or a counter that restarted. Combine with face-only or overall-only to group by one color, then by time |
 
 ### Sorting in Lightroom Classic
 
@@ -88,6 +89,16 @@ New options:
 - **整體偏重演出者 (weight the performer)**: tick it when the LED wall behind is very colorful, so the light around the performer counts more
 - **表格排序 (table order)**: by capture time, filename or color
 - **匯出 CSV (export CSV)**: saves the table into the photo folder; opens in Excel
+
+## Restoring names after editing
+
+After editing RAW files and exporting JPGs, the exported names usually still carry the color prefix, and editors often add a suffix, e.g. `8粉_0012_DSC02921-Enhanced-NR.jpg`.
+
+Choose the export folder in the app and press 還原修圖後檔名 (restore edited names) to get `DSC02921-Enhanced-NR.jpg`: only the part this tool added is removed, the suffix stays. With the original names back, sorting by filename follows the shooting order again.
+
+- If the export folder is separate from the originals, the app asks for the originals folder and matches against the rename log there. This is the most precise method, and **only photos in the log are touched**; files you named yourself (e.g. `白_婚禮.jpg`) are left alone
+- Only when no log is found does it fall back to removing a leading color prefix by pattern
+- It lists the changes before renaming, and 復原上一次 (undo) reverts them
 
 ## How it works
 
