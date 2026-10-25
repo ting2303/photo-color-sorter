@@ -83,12 +83,18 @@ After analysis the table shows a few extra columns to help you decide what to ed
 | 代表 (pick) | ★ marks the best photo to edit first in each scene (sharp, large face, good exposure). Edit it, then sync to the scene |
 | 清晰度 (sharpness) | Relative score 0–100 within the batch |
 | `?` after 整體 | Low vote share for the overall color; the frame is mixed, check it yourself |
+| 星等 (stars) | Automatic 1–3 star pre-pick, relative to the batch: 1 = no face or likely blurred, 3 = sharp, large face, good exposure |
+| 人物 (person) | Photos of the same person share a group (P1 has the most photos). It only compares faces; it does not identify anyone. Heavy makeup, profiles or small faces can split one person into two groups |
+| 亮度 (brightness) | 亮/中/暗 (bright/mid/dim) compared with that person's brightest photos, so spotlight changes within a song can be synced separately |
+| 調色起點 (WB start) | Direction and strength of the face color cast, e.g. 色溫+20 色調-12 = warmer and greener. A suggestion only: nothing is written to files, and the numbers are not exact Lightroom slider values |
 
 New options:
 
 - **整體偏重演出者 (weight the performer)**: tick it when the LED wall behind is very colorful, so the light around the performer counts more
 - **表格排序 (table order)**: by capture time, filename or color
 - **匯出 CSV (export CSV)**: saves the table into the photo folder; opens in Excel
+- **燈光時間軸 (lighting timeline)**: a timeline of the whole show's lighting, scene boundaries and picks
+- **分析報告 (analysis report)**: batch statistics plus anything to watch out for (e.g. most photos classed white, no capture times, many photos without a detected face) and what to change. The status bar also says how many items need attention
 
 ## Restoring names after editing
 

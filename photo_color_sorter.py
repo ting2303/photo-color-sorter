@@ -25,7 +25,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
   圖形介面：  python photo_color_sorter.py [資料夾]
   命令列：    python photo_color_sorter.py <資料夾> --preview|--apply [--output rename|folder]
               [--mode both|skin|main] [--order skin|main] [--no-digits] [-r]
-              [--performer] [--csv 結果.csv] [--time-seq]
+              [--performer] [--csv 結果.csv] [--time-seq] [--report [報告.txt]]
   還原修圖後檔名：python photo_color_sorter.py <輸出資料夾> --restore [--log-folder 原始資料夾] [--apply]
 """
 import os
@@ -44,7 +44,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.1.0'
+__version__ = '1.2.0'
 
 try:
     import rawpy
@@ -92,6 +92,9 @@ PERFORMER_WEIGHT = 3.0    # 「整體偏重演出者」：演出者周圍的票�
 UNCERTAIN_RATIO = 0.35    # 主色票數低於此比例時，表格標示「?」（不影響檔名）
 SCENE_GAP_SEC = 60        # 燈光段落：兩張照片間隔超過這麼多秒就切成新段落
 SCENE_MIN_LEN = 3         # 燈光段落：少於這麼多張的段落併入前一段（避免單張誤判切出一堆小段）
+BRIGHT_EV = (-0.5, -1.5)  # 亮度分組：和參考亮度相差 0.5 級內為亮、1.5 級內為中，更暗為暗
+STAR_BLUR_SCORE = 15      # 自動評分：清晰度低於此分（整批最後約 15%）給 1 星
+WB_MIN_SHIFT = 4          # 調色起點：臉的色偏小於此值（Lab 色度差）視為正常
 SKIN_NATURAL_S = 0.62     # 膚色：在膚色色相範圍內且飽和度低於此值 = 自然光
 SKIN_NATURAL_HUE = (5, 40)
 
@@ -216,11 +219,39 @@ def analyze_overall(img, return_highlight=False, performer_boxes=None):
 APP_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # 打包成 exe 時的資料位置
 YUNET_MODEL = os.path.join(APP_DIR, 'face_detection_yunet_2023mar.onnx')
 YUNET_SHA256 = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
+SFACE_MODEL = os.path.join(APP_DIR, 'face_recognition_sface_2021dec_int8.onnx')  # 人物分組用（選配）
+SFACE_SHA256 = '2b0e941e6f16cc048c20aee0c8e31f569118f65d702914540f7bfdc14048d78a'
+SAME_PERSON_COS = 0.363  # SFace：兩張臉特徵的相似度超過此值視為同一人（OpenCV 官方建議值）
 FACE_SCORE = 0.7         # YuNet 人臉信心門檻，誤判多就調高、漏抓多就調低
 DETECT_SIDE = 1920        # 偵測用解析度，遠景小臉需要較高解析度
 
 _cascades = None
 _yunet = None
+_sface = None
+
+
+class Face(tuple):
+    """(x, y, w, h, 信心)，另外帶著 YuNet 的五官位置（raw），人物分組對齊臉部時使用"""
+    raw = None
+
+
+def _get_sface():
+    """人臉辨識模型（只判斷兩張臉像不像，不辨識身分）；沒有模型檔或驗證失敗時回傳 False，人物分組就略過"""
+    global _sface
+    if _sface is None:
+        _sface = False
+        try:
+            if os.path.exists(SFACE_MODEL) and hasattr(cv2, 'FaceRecognizerSF'):
+                data = np.fromfile(SFACE_MODEL, np.uint8)
+                if hashlib.sha256(data.tobytes()).hexdigest() == SFACE_SHA256:
+                    _sface = cv2.FaceRecognizerSF.create('onnx', data, np.array([], np.uint8))
+        except Exception:
+            _sface = False
+    return _sface
+
+
+def sface_available():
+    return bool(_get_sface())
 
 
 def _get_cascades():
@@ -255,8 +286,13 @@ def detect_faces(img):
         _, faces = yunet.detect(img)
         if faces is None:
             return []
-        return [(int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[14]))
-                for f in faces if min(f[2], f[3]) >= 10]
+        out = []
+        for f in faces:
+            if min(f[2], f[3]) >= 10:
+                face = Face((int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[14])))
+                face.raw = f.copy()
+                out.append(face)
+        return out
     frontal, profile = _get_cascades()
     gray = cv2.equalizeHist(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
     min_side = max(24, int(min(gray.shape) * 0.03))
@@ -475,6 +511,36 @@ def _grad_energy(c, sigma):
     return float(np.mean(gx * gx + gy * gy)) * sigma * sigma
 
 
+def face_embedding(work, faces):
+    """最大那張臉的特徵向量（128 維，已正規化），用來判斷是不是同一人；沒有模型或沒有臉時回傳 None"""
+    rec = _get_sface()
+    if not rec or not faces:
+        return None
+    f = max(faces, key=lambda x: x[2] * x[3])
+    if getattr(f, 'raw', None) is None:
+        return None  # Haar 偵測沒有五官位置，無法對齊
+    try:
+        emb = rec.feature(rec.alignCrop(work, f.raw)).flatten().astype(np.float32)
+        n = float(np.linalg.norm(emb))
+        return (emb / n).tolist() if n > 0 else None
+    except Exception:
+        return None
+
+
+def face_lab(work, faces):
+    """最大那張臉中央的 Lab 色度 (a, b)：a 正 = 偏洋紅、負 = 偏綠；b 正 = 偏黃、負 = 偏藍"""
+    if not faces:
+        return None
+    x, y, w, h, _ = max(faces, key=lambda f: f[2] * f[3])
+    mask = np.zeros(work.shape[:2], np.uint8)
+    cv2.ellipse(mask, (int(x + w / 2), int(y + h * 0.55)), (int(w * 0.32), int(h * 0.36)), 0, 0, 360, 255, -1)
+    sel = mask > 0
+    if sel.sum() < 20:
+        return None
+    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)[sel].astype(np.float32)
+    return float(np.median(lab[:, 1]) - 128), float(np.median(lab[:, 2]) - 128)
+
+
 def photo_metrics(work, faces):
     """清晰度、最大臉的邊長（像素）、臉部亮度（0~1）。
     清晰度 = 細尺度與粗尺度邊緣能量的比值：對焦清楚時細節多、比值高；
@@ -515,11 +581,13 @@ def analyze_group(group):
         else:
             main_p, main_p_ratio, top_p = main, main_ratio, top
         sharp, face_px, face_bright = photo_metrics(work, faces)
+        emb = face_embedding(work, faces)
+        ab = face_lab(work, faces)
         t, t_src = group_capture_time(group)
         return dict(group, skin=skin, skin_ratio=skin_ratio, faces=nfaces,
                     main=main, main_ratio=main_ratio, top=top, highlight=highlight,
                     main_perf=main_p, main_perf_ratio=main_p_ratio, top_perf=top_p,
-                    sharp=sharp, face_px=face_px, face_bright=face_bright,
+                    sharp=sharp, face_px=face_px, face_bright=face_bright, face_emb=emb, face_ab=ab,
                     time=t, time_src=t_src, error=None)
     except Exception as e:
         return dict(group, error=str(e))
@@ -598,24 +666,211 @@ def batch_features(results, mode='both', order='skin', performer=False):
             expo = 1 - min(abs(r['face_bright'] - 0.55) / 0.55, 1) if r['face_bright'] is not None else 0.5
             return 0.5 * r['sharp_score'] / 100 + 0.25 * r['face_px'] / big + 0.25 * expo
         max(with_face, key=score)['rep'] = True
+    _assign_persons(out)
+    _assign_brightness(out)
+    _assign_stars(out)
+    _assign_wb(out)
     return out + bad
+
+
+def _assign_persons(rows):
+    """人物分組：依拍攝時間逐張比對每一組的平均臉部特徵，相似度夠高就歸同一人，否則開新的一組。
+    組別依照片數多到少命名 P1、P2…；沒有臉或沒有模型時為 None。"""
+    centers, members = [], []
+    for i, r in enumerate(rows):
+        e = r.get('face_emb')
+        r['person'] = None
+        if e is None:
+            continue
+        e = np.asarray(e, np.float32)
+        if centers:
+            sims = np.array([float(c @ e) / max(float(np.linalg.norm(c)), 1e-9) for c in centers])
+            k = int(sims.argmax())
+            if sims[k] >= SAME_PERSON_COS:
+                centers[k] = centers[k] + e
+                members[k].append(i)
+                continue
+        centers.append(e.copy())
+        members.append([i])
+    order = sorted(range(len(members)), key=lambda k: (-len(members[k]), members[k][0]))
+    for rank, k in enumerate(order, 1):
+        for i in members[k]:
+            rows[i]['person'] = 'P%d' % rank
+
+
+def _linear(v):
+    return ((v + 0.055) / 1.055) ** 2.4 if v > 0.04045 else v / 12.92
+
+
+def _assign_brightness(rows):
+    """亮度分組（亮／中／暗）：和同一個人最亮的幾張比（沒有人物分組時和整批比），
+    差 0.5 級以內為亮、1.5 級以內為中、更暗為暗。舞台上同一首歌追光忽亮忽暗時，可以分開同步。"""
+    def ref_of(vals):
+        return float(np.percentile(vals, 90)) if vals else None
+    lin = {i: _linear(r['face_bright']) for i, r in enumerate(rows) if r.get('face_bright')}
+    all_ref = ref_of(list(lin.values()))
+    by_person = {}
+    for i, r in enumerate(rows):
+        if i in lin and r.get('person'):
+            by_person.setdefault(r['person'], []).append(lin[i])
+    refs = {p: ref_of(v) for p, v in by_person.items() if len(v) >= 3}
+    for i, r in enumerate(rows):
+        r['bright'], r['ev'] = None, None
+        if i not in lin or not all_ref:
+            continue
+        ref = refs.get(r.get('person'), all_ref)
+        ev = float(np.log2(max(lin[i], 1e-6) / max(ref, 1e-6)))
+        r['ev'] = ev
+        r['bright'] = '亮' if ev >= BRIGHT_EV[0] else '中' if ev >= BRIGHT_EV[1] else '暗'
+
+
+def _assign_stars(rows):
+    """自動評分 1~3 星（整批相對，用來初篩）：
+    1 星 = 沒有臉，或清晰度在整批最後 15%；
+    3 星 = 清晰度前段（≥50）、臉不小於整批中位數、亮度為亮或中、臉沒有過曝或太暗；其餘 2 星。"""
+    sizes = [r['face_px'] for r in rows if r['faces']]
+    med = float(np.median(sizes)) if sizes else 0.0
+    for r in rows:
+        if not r['faces'] or r['sharp_score'] < STAR_BLUR_SCORE:
+            r['stars'], r['star_why'] = 1, '沒有臉' if not r['faces'] else '可能模糊'
+        elif (r['sharp_score'] >= 50 and r['face_px'] >= med and r.get('bright') in ('亮', '中')
+              and r.get('face_bright') is not None and 0.2 <= r['face_bright'] <= 0.9):
+            r['stars'], r['star_why'] = 3, ''
+        else:
+            why = []
+            if r['sharp_score'] < 50:
+                why.append('清晰度普通')
+            if r['face_px'] < med:
+                why.append('臉偏小')
+            if r.get('bright') == '暗':
+                why.append('偏暗')
+            fb = r.get('face_bright')
+            if fb is not None and not 0.2 <= fb <= 0.9:
+                why.append('臉過曝' if fb > 0.9 else '臉太暗')
+            r['stars'], r['star_why'] = 2, '、'.join(why)
+
+
+def _assign_wb(rows):
+    """調色起點建議：臉的顏色和「同一個人在自然光下的膚色」比，偏了多少、往哪個方向。
+    只給方向與相對強度（Lab 色度差），不寫入檔案；數值不是 Lightroom 滑桿的精確值。
+    色溫為負 = 往冷（藍）調，正 = 往暖（黃）調；色調為負 = 往綠調，正 = 往洋紅調。"""
+    natural = [r for r in rows if r.get('face_ab') and r['skin'] == WHITE]
+    def med_ab(rs):
+        return (float(np.median([r['face_ab'][0] for r in rs])), float(np.median([r['face_ab'][1] for r in rs]))) if rs else None
+    all_ref = med_ab(natural)
+    by_person = {}
+    for r in natural:
+        if r.get('person'):
+            by_person.setdefault(r['person'], []).append(r)
+    refs = {p: med_ab(v) for p, v in by_person.items() if len(v) >= 2}
+    for r in rows:
+        r['wb_temp'] = r['wb_tint'] = r['wb_shift'] = None
+        ref = refs.get(r.get('person'), all_ref)
+        if not r.get('face_ab') or ref is None:
+            continue
+        da, db = r['face_ab'][0] - ref[0], r['face_ab'][1] - ref[1]
+        r['wb_shift'] = float(np.hypot(da, db))
+        r['wb_temp'], r['wb_tint'] = -db, -da
+
+
+def wb_text(r):
+    """調色起點建議的文字，例如「色溫−9 色調−6」；偏差很小時回傳「—」"""
+    if r.get('wb_shift') is None:
+        return ''
+    if r['wb_shift'] < WB_MIN_SHIFT:
+        return '—'
+    return '色溫%+d 色調%+d' % (round(r['wb_temp']), round(r['wb_tint']))
+
+
+def build_report(rows, mode='both', order='skin'):
+    """分析報告：整批結果的統計，以及需要注意的地方。回傳 (摘要行清單, 提醒清單)。
+    提醒依「⚠ 需要注意」與「ℹ 參考」分級，讓使用者知道這次的結果可不可靠、該怎麼調。"""
+    ok = [r for r in rows if not r.get('error')]
+    bad = [r for r in rows if r.get('error')]
+    n = len(ok)
+    lines, notes = [], []
+    pct = lambda k: 100.0 * k / n if n else 0.0
+    lines.append('照片：%d 張成功分析%s' % (n, '，%d 張讀取失敗' % len(bad) if bad else ''))
+    if not n:
+        notes.append('⚠ 沒有任何照片分析成功，請確認資料夾裡是支援的照片格式')
+        return lines, notes
+    def dist(key):
+        c = {}
+        for r in ok:
+            c[r[key]] = c.get(r[key], 0) + 1
+        return '、'.join('%s %d' % (label(k), v) for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
+    lines.append('整體主色：' + dist('main'))
+    lines.append('膚色：' + dist('skin'))
+    exif = sum(r['time_src'] == 'EXIF' for r in ok)
+    lines.append('拍攝時間：%d 張讀到 EXIF（%.0f%%）' % (exif, pct(exif)))
+    scenes = len({r['scene'] for r in ok})
+    lines.append('燈光段落：%d 段，每段平均 %.1f 張' % (scenes, n / max(scenes, 1)))
+    persons = {r['person'] for r in ok if r.get('person')}
+    with_face = [r for r in ok if r['faces']]
+    if not sface_available():
+        lines.append('人物分組：沒有人臉辨識模型，已略過')
+    else:
+        lines.append('人物分組：%d 組（%d 張有臉）' % (len(persons), len(with_face)))
+    stars = {s: sum(r['stars'] == s for r in ok) for s in (3, 2, 1)}
+    lines.append('自動評分：3 星 %d、2 星 %d、1 星 %d' % (stars[3], stars[2], stars[1]))
+    br = {b: sum(r.get('bright') == b for r in ok) for b in ('亮', '中', '暗')}
+    lines.append('亮度分組：亮 %d、中 %d、暗 %d' % (br['亮'], br['中'], br['暗']))
+    shifted = [r for r in ok if r.get('wb_shift') is not None and r['wb_shift'] >= WB_MIN_SHIFT]
+    lines.append('調色起點：%d 張的臉有明顯色偏，建議先調白平衡' % len(shifted))
+
+    white = sum(r['main'] == WHITE for r in ok)
+    unc = sum(r['uncertain'] for r in ok)
+    noface = n - len(with_face)
+    if bad:
+        notes.append('⚠ %d 張讀取失敗（表格中紅色列），其他照片不受影響' % len(bad))
+    if n >= 10 and pct(white) >= 60:
+        notes.append('⚠ %.0f%% 的照片整體判成白：可能是白光為主或顏色很淡的舞台，'
+                     '可以改用「只看膚色」，或把顏色明顯的段落另外處理' % pct(white))
+    if n >= 10 and pct(unc) >= 40:
+        notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：畫面顏色很雜，背景 LED 螢幕很花時可以勾「整體偏重演出者」' % pct(unc))
+    if n >= 5 and pct(noface) >= 50:
+        notes.append('⚠ %.0f%% 的照片沒偵測到臉：膚色、人物分組、亮度與評分會較少，建議以「只看整體」分類' % pct(noface))
+    if exif == 0:
+        notes.append('ℹ 沒有讀到任何拍攝時間（可能是截圖、轉存或社群下載的照片），段落與時間序號改用檔案時間，順序可能不準')
+    elif exif < n:
+        notes.append('ℹ %d 張沒有拍攝時間，改用檔案時間（表格時間後面有 *）' % (n - exif))
+    if sface_available() and len(with_face) >= 6 and len(persons) > max(3, len(with_face) // 3):
+        notes.append('ℹ 人物分組有 %d 組，可能比實際人數多：濃妝、側臉、臉太小或模糊都會讓同一人被拆開' % len(persons))
+    if n >= 10 and stars[1] >= 0.5 * n:
+        notes.append('ℹ 一半以上是 1 星：評分是整批相對比較，如果整批都很清楚，請以清晰度數字為準')
+    if scenes >= 0.6 * n and n >= 10:
+        notes.append('ℹ 段落很碎（%d 張分成 %d 段）：燈光變化很快，或拍攝時間不連續' % (n, scenes))
+    if not notes:
+        notes.append('✓ 沒有發現異常')
+    return lines, notes
+
+
+def report_text(rows, mode='both', order='skin', folder=None):
+    lines, notes = build_report(rows, mode, order)
+    head = ['舞台照片色彩分類工具 v%s 分析報告' % __version__,
+            '時間：%s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
+    if folder:
+        head.append('資料夾：%s' % folder)
+    return '\n'.join(head + [''] + lines + ['', '需要注意：'] + notes) + '\n'
 
 
 def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False):
     """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟"""
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
-        wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '臉數', '膚色', '膚色比例',
-                     '整體', '整體比例', '整體組成', '燈光爆點', '不確定', '結果', '錯誤'])
+        wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '人物', '亮度',
+                     '調色起點建議', '臉數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
+                     '結果', '錯誤'])
         for r in rows:
             if r.get('error'):
-                wr.writerow([r['source']] + [''] * 14 + [r['error']])
+                wr.writerow([r['source']] + [''] * 19 + [r['error']])
                 continue
             clean = strip_prefix(r['source'])
             new = (os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
                    else build_prefix(r, mode, order, digits, time_seq) + clean)
             wr.writerow([r['source'], r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
-                         'S%02d' % r['scene'], '★' if r['rep'] else '', r['sharp_score'], r['faces'],
+                         'S%02d' % r['scene'], '★' if r['rep'] else '', r['sharp_score'], r.get('stars', ''),
+                         r.get('star_why', ''), r.get('person') or '', r.get('bright') or '', wb_text(r), r['faces'],
                          label(r['skin']), '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                          label(r['main']), '%d%%' % (r['main_ratio'] * 100),
                          ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top']),
@@ -846,7 +1101,7 @@ def run_gui(initial_folder=None):
         pass
     root = tk.Tk()
     root.title('舞台照片色彩分類工具 v%s　© 2026 ting2303・僅限非商業用途' % __version__)
-    root.geometry('1320x720')
+    root.geometry('1360x760')
 
     folder = tk.StringVar()
     recursive = tk.BooleanVar(value=False)
@@ -897,14 +1152,16 @@ def run_gui(initial_folder=None):
                             variable=time_seq, command=on_option)
     c_seq.pack(side='left', padx=(16, 0))
     ttk.Label(opts2, text='　　表格排序：').pack(side='left')
-    for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color')):
+    for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人物', 'person'), ('星等', 'stars')):
         ttk.Radiobutton(opts2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
 
     ttk.Label(root, padding=(8, 4), foreground='#555',
               text='顏色：0白(白光/自然膚色) 1紅 2橙 3黃 4綠 5青 6藍 7紫 8粉 9暗 無(沒偵測到臉)'
                    '　｜　改檔名例：6藍7紫_原檔名 → 前面是優先項目，後面是另一項'
                    '\n段落：照拍攝時間切開的同燈光區段　★：該段代表張（先修這張再同步）　'
-                   '清晰度：整批相對分數 0~100　?：主色票數偏低，建議人工確認').pack(fill='x')
+                   '清晰度：整批相對分數 0~100　?：主色票數偏低，建議人工確認'
+                   '\n星等：整批相對初篩　人物：同一人歸同一組（P1 照片最多）　亮度：和同一人最亮的照片比　'
+                   '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案').pack(fill='x')
 
     btns = ttk.Frame(root, padding=8)
     btns.pack(fill='x')
@@ -914,16 +1171,19 @@ def run_gui(initial_folder=None):
     b_strip = ttk.Button(btns, text='移除所有顏色前綴', command=lambda: do_strip())
     b_csv = ttk.Button(btns, text='匯出 CSV', command=lambda: do_export())
     b_restore = ttk.Button(btns, text='還原修圖後檔名', command=lambda: do_restore())
-    for b in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore):
+    b_timeline = ttk.Button(btns, text='燈光時間軸', command=lambda: do_timeline())
+    b_report = ttk.Button(btns, text='分析報告', command=lambda: do_report())
+    for b in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore, b_timeline, b_report):
         b.pack(side='left', padx=4)
     pbar = ttk.Progressbar(btns, length=250)
     pbar.pack(side='right')
 
     # --- 預覽表格
-    cols = ('file', 'time', 'scene', 'rep', 'sharp', 'faces', 'skin', 'skin_r', 'main', 'main_r', 'top', 'hl', 'new')
-    heads = ('原檔名', '拍攝時間', '段落', '代表', '清晰度', '臉數', '膚色', '膚色比例', '整體', '整體比例',
-             '整體組成', '燈光爆點', '結果')
-    widths = (170, 95, 45, 40, 55, 40, 45, 65, 50, 65, 160, 65, 300)
+    cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'person', 'bright', 'wb', 'faces', 'skin', 'skin_r',
+            'main', 'main_r', 'top', 'hl', 'new')
+    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '臉數', '膚色', '膚色比例',
+             '整體', '整體比例', '整體組成', '燈光爆點', '結果')
+    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 40, 45, 65, 50, 65, 160, 65, 300)
     frame = ttk.Frame(root)
     frame.pack(fill='both', expand=True, padx=8)
     tree = ttk.Treeview(frame, columns=cols, show='headings')
@@ -931,9 +1191,13 @@ def run_gui(initial_folder=None):
         tree.heading(c, text=hd)
         tree.column(c, width=w, anchor='w')
     sb = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
-    tree.configure(yscrollcommand=sb.set)
-    tree.pack(side='left', fill='both', expand=True)
-    sb.pack(side='right', fill='y')
+    sbx = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
+    tree.configure(yscrollcommand=sb.set, xscrollcommand=sbx.set)
+    tree.grid(row=0, column=0, sticky='nsew')
+    sb.grid(row=0, column=1, sticky='ns')
+    sbx.grid(row=1, column=0, sticky='ew')
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
     for i, c in enumerate(TAG_COLORS):
         tree.tag_configure('c%d' % i, background=c)
     tree.tag_configure('err', background='#ffdddd', foreground='#a00')
@@ -942,7 +1206,7 @@ def run_gui(initial_folder=None):
 
     def set_busy(b):
         state['busy'] = b
-        for w in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore):
+        for w in (b_analyze, b_apply, b_undo, b_strip, b_csv, b_restore, b_timeline, b_report):
             w.state(['disabled'] if b else ['!disabled'])
         if not b and output.get() == 'folder':
             b_strip.state(['disabled'])
@@ -953,6 +1217,11 @@ def run_gui(initial_folder=None):
         sk = slot_order(mode.get(), order.get())
         if sort_by.get() == 'name':
             rows.sort(key=lambda r: (r['dir'], r['stem']))
+        elif sort_by.get() == 'person':
+            rows.sort(key=lambda r: (1, '', r['source']) if r.get('error') else
+                      (0 if r.get('person') else 1, int((r.get('person') or 'P0')[1:]), r['time']))
+        elif sort_by.get() == 'stars':
+            rows.sort(key=lambda r: (1, 0, r['source']) if r.get('error') else (0, -r['stars'], r['time']))
         elif sort_by.get() == 'color':
             rows.sort(key=lambda r: (1, r['source']) if r.get('error') else
                       (0, build_prefix(r, mode.get(), order.get(), True, time_seq.get()), r['time']))
@@ -963,7 +1232,7 @@ def run_gui(initial_folder=None):
         rows, sort_key = current_rows()
         for r in rows:
             if r.get('error'):
-                tree.insert('', 'end', values=(r['source'], '', '', '', '', '', '錯誤', '', '', '', r['error'], '', ''),
+                tree.insert('', 'end', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', ''),
                             tags=('err',))
                 continue
             clean = strip_prefix(r['source'])
@@ -977,8 +1246,8 @@ def run_gui(initial_folder=None):
             top3 = ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top'])
             t = r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*')
             tree.insert('', 'end', tags=('c%d' % r[sort_key],), values=(
-                r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] else '', r['sharp_score'],
-                r['faces'], label(r['skin']),
+                r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] else '', '★' * r['stars'], r['sharp_score'],
+                r.get('person') or '', r.get('bright') or '', wb_text(r), r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                 label(r['main']) + ('?' if r['uncertain'] else ''), '%d%%' % (r['main_ratio'] * 100), top3,
                 '%d%%' % (r.get('highlight', 0) * 100), new))
@@ -1022,8 +1291,12 @@ def run_gui(initial_folder=None):
                     state['results'] = msg[1]
                     refresh_table()
                     errs = sum(1 for r in msg[1] if r.get('error'))
-                    status.set('分析完成：%d 張%s。可切換上方選項看結果，確認後按「②」。'
-                               % (len(msg[1]), '，%d 張讀取失敗' % errs if errs else ''))
+                    _, notes = build_report(current_rows()[0], mode.get(), order.get())
+                    warn = [x for x in notes if x.startswith('⚠')]
+                    status.set('分析完成：%d 張%s。%s' % (
+                        len(msg[1]), '，%d 張讀取失敗' % errs if errs else '',
+                        '有 %d 項需要注意，請按「分析報告」查看。' % len(warn) if warn
+                        else '可切換上方選項看結果，確認後按「②」。'))
                     set_busy(False)
                 elif msg[0] == 'fail':
                     set_busy(False)
@@ -1116,6 +1389,80 @@ def run_gui(initial_folder=None):
         status.set('已移除 %d 個檔案的前綴' % len(done))
         messagebox.showinfo('完成', '已移除 %d 個檔案的前綴' % len(done) + ('\n%d 個失敗' % len(errors) if errors else ''))
 
+    def do_report():
+        if not state['results']:
+            messagebox.showinfo('提示', '請先按「① 分析」')
+            return
+        rows, _ = current_rows()
+        text = report_text(rows, mode.get(), order.get(), folder.get().strip())
+        win = tk.Toplevel(root)
+        win.title('分析報告')
+        win.geometry('720x520')
+        box = tk.Text(win, wrap='word', font=('Microsoft JhengHei UI', 11), padx=10, pady=10)
+        box.insert('1.0', text)
+        box.configure(state='disabled')
+        box.pack(fill='both', expand=True)
+        bar = ttk.Frame(win, padding=6)
+        bar.pack(fill='x')
+
+        def save():
+            f = folder.get().strip()
+            if not f or not os.path.isdir(f):
+                return
+            stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            path, k = os.path.join(f, '_分析報告_%s.txt' % stamp), 1
+            while os.path.exists(path):
+                k += 1
+                path = os.path.join(f, '_分析報告_%s_%d.txt' % (stamp, k))
+            with open(path, 'w', encoding='utf-8-sig') as fp:
+                fp.write(text)
+            messagebox.showinfo('完成', '已存到資料夾內：\n%s' % os.path.basename(path), parent=win)
+        ttk.Button(bar, text='存成文字檔', command=save).pack(side='right')
+        ttk.Button(bar, text='關閉', command=win.destroy).pack(side='right', padx=6)
+
+    def do_timeline():
+        if not state['results']:
+            messagebox.showinfo('提示', '請先按「① 分析」')
+            return
+        rows = [r for r in batch_features(state['results'], mode.get(), order.get(), performer.get())
+                if not r.get('error')]
+        if not rows:
+            return
+        win = tk.Toplevel(root)
+        win.title('燈光時間軸')
+        W, H, L, R = 1000, 260, 70, 20
+        cv = tk.Canvas(win, width=W, height=H, background='white')
+        cv.pack(fill='both', expand=True)
+        t0, t1 = rows[0]['time'], rows[-1]['time']
+        span = max((t1 - t0).total_seconds(), 1.0)
+        # 照片太少或時間都一樣時，改成照順序平均排開
+        use_index = (t1 - t0).total_seconds() < 1
+        xs = [L + (W - L - R) * ((i / max(len(rows) - 1, 1)) if use_index else
+                                 (r['time'] - t0).total_seconds() / span) for i, r in enumerate(rows)]
+        cv.create_text(8, 70, text='整體主色', anchor='w')
+        cv.create_text(8, 130, text='膚色', anchor='w')
+        cv.create_text(8, 180, text='照片', anchor='w')
+        for i, r in enumerate(rows):
+            x0 = xs[i]
+            x1 = xs[i + 1] if i + 1 < len(rows) else x0 + 4
+            x1 = max(x1, x0 + 2)
+            cv.create_rectangle(x0, 50, x1, 90, fill=TAG_COLORS[r['main']], outline='')
+            cv.create_rectangle(x0, 110, x1, 150, fill=TAG_COLORS[r['skin']], outline='')
+            cv.create_line(x0, 172, x0, 188, fill='#333')
+            if r['rep']:
+                cv.create_text(x0, 200, text='★', fill='#b8860b')
+            if i and r['scene'] != rows[i - 1]['scene']:
+                cv.create_line(x0, 40, x0, 160, fill='#444', dash=(3, 3))
+        last_x = -100
+        for s in sorted({r['scene'] for r in rows}):
+            first = next(i for i, r in enumerate(rows) if r['scene'] == s)
+            if xs[first] - last_x >= 28:  # 段落太近時不畫標籤，避免文字疊在一起
+                cv.create_text(xs[first] + 2, 30, text='S%02d' % s, anchor='w', font=('Segoe UI', 8))
+                last_x = xs[first]
+        cv.create_text(L, H - 20, anchor='w', text=t0.strftime('%H:%M:%S'))
+        cv.create_text(W - R, H - 20, anchor='e', text=t1.strftime('%H:%M:%S'))
+        cv.create_text(W / 2, H - 20, text='虛線 = 段落交界　★ = 代表張' + ('　（沒有拍攝時間，照順序排列）' if use_index else ''))
+
     def do_restore():
         f = check_folder()
         if not f:
@@ -1169,6 +1516,8 @@ def run_cli(argv):
     ap.add_argument('--performer', action='store_true', help='整體偏重演出者（背景 LED 螢幕很花時使用）')
     ap.add_argument('--csv', metavar='PATH', help='把分析結果（含挑圖資訊）存成 CSV')
     ap.add_argument('--time-seq', action='store_true', help='同色內依拍攝時間排列（檔名加時間序號）')
+    ap.add_argument('--report', nargs='?', const='-', metavar='PATH',
+                    help='印出分析報告；給檔名則另外存成文字檔')
     ap.add_argument('--restore', action='store_true', help='還原修圖輸出後的檔名（移除本工具加的前綴）')
     ap.add_argument('--log-folder', action='append', default=[], metavar='DIR',
                     help='搭配 --restore：原始照片所在的資料夾（讀它的改名紀錄），可指定多次')
@@ -1197,11 +1546,18 @@ def run_cli(argv):
         if r.get('error'):
             print('[錯誤] %s：%s' % (r['source'], r['error']))
         else:
-            print('%-40s %s S%02d%s 清晰:%3d 臉:%d 膚色:%s(%d%%) 整體:%s%s(%d%%) 爆點:%d%%' % (
+            print('%-40s %s S%02d%s %-3s 清晰:%3d %-3s %s 臉:%d 膚色:%s(%d%%) 整體:%s%s(%d%%) 爆點:%d%% %s' % (
                 r['source'], r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*'),
-                r['scene'], '★' if r['rep'] else ' ', r['sharp_score'], r['faces'], label(r['skin']),
-                r['skin_ratio'] * 100, label(r['main']), '?' if r['uncertain'] else '', r['main_ratio'] * 100,
-                r.get('highlight', 0) * 100))
+                r['scene'], '★' if r['rep'] else ' ', '*' * r['stars'], r['sharp_score'], r.get('person') or '-',
+                r.get('bright') or '-', r['faces'], label(r['skin']), r['skin_ratio'] * 100, label(r['main']),
+                '?' if r['uncertain'] else '', r['main_ratio'] * 100, r.get('highlight', 0) * 100, wb_text(r)))
+    if a.report:
+        text = report_text(rows, a.mode, a.order, a.folder)
+        print('\n' + text)
+        if a.report != '-':
+            with open(a.report, 'w', encoding='utf-8-sig') as fp:
+                fp.write(text)
+            print('已存分析報告：%s' % a.report)
     if a.csv:
         export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
         print('已匯出 CSV：%s' % a.csv)

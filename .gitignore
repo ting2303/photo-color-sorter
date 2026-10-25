@@ -24,5 +24,7 @@ venv/
 *.xmp
 _色彩分類紀錄_*.csv
 _色彩改名紀錄_*.csv
+_色彩分析_*.csv
+_分析報告_*.txt
 !docs/images/*.png
 !docs/images/*.jpg
