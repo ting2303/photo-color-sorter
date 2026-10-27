@@ -814,3 +814,270 @@ class ExtremeInputTests(FakeRows, unittest.TestCase):
         rows[1]['time'] = datetime.datetime(2099, 1, 1)
         _, notes = pcs.build_report(pcs.batch_features(rows))
         self.assertTrue([x for x in notes if x.startswith('ℹ 1 張的拍攝時間在未來')])
+
+
+# ---------------------------------------------------------------- 寫入 Lightroom 標籤（XMP）
+
+LR_XMP = '''<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 7.0-c000 1.000000">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
+   xmp:Rating="4"
+   xmp:Label="Green"
+   crs:Version="16.0"
+   crs:Exposure2012="+0.35"
+   crs:Look="A &amp; B&#xA;第二行&#x9;tab"
+   crs:HasSettings="True">
+   <crs:ToneCurvePV2012>
+    <rdf:Seq>
+     <rdf:li>0, 0</rdf:li>
+     <rdf:li>255, 255</rdf:li>
+    </rdf:Seq>
+   </crs:ToneCurvePV2012>
+   <crs:LookTable>
+    <rdf:Description crs:Name="Adobe Color" crs:Amount="1"/>
+   </crs:LookTable>
+   <dc:subject>
+    <rdf:Bag>
+     <rdf:li>婚禮</rdf:li>
+     <rdf:li>藍</rdf:li>
+    </rdf:Bag>
+   </dc:subject>
+   <lr:hierarchicalSubject>
+    <rdf:Bag>
+     <rdf:li>活動|婚禮</rdf:li>
+     <rdf:li>色彩|藍</rdf:li>
+    </rdf:Bag>
+   </lr:hierarchicalSubject>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+'''.encode('utf-8')
+
+
+def canonical_without_ours(data, ours=()):
+    """把本工具會動的欄位（星等、色標、「舞台色彩|…」與 ours 裡的最末層字）拿掉後做 C14N 正規化：
+    其他內容（crs 修圖設定、使用者關鍵字）必須完全一樣"""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(data)
+    xmp_ns, rdf_ns = '{http://ns.adobe.com/xap/1.0/}', '{http://www.w3.org/1999/02/22-rdf-syntax-ns#}'
+    ours = set(ours)
+    for el in root.iter():
+        for k in (xmp_ns + 'Rating', xmp_ns + 'Label'):
+            el.attrib.pop(k, None)
+        for bag in el.findall(rdf_ns + 'Bag'):
+            for li in list(bag):
+                t = (li.text or '').strip()
+                if t.startswith(pcs.XMP_ROOT + '|') or t in ours:
+                    bag.remove(li)
+    for el in root.iter():  # 縮排空白不算內容
+        if el.text is not None and not el.text.strip():
+            el.text = None
+        el.tail = None
+    return ET.canonicalize(ET.tostring(root, encoding='unicode'))
+
+
+class XmpTests(FakeRows, unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def make(self, files_per_photo, specs=None):
+        """在暫存資料夾建立檔案，回傳 batch_features 算好的 rows"""
+        specs = specs or [dict() for _ in files_per_photo]
+        for i, files in enumerate(files_per_photo):
+            specs[i] = dict(specs[i], dir=self.dir, stem=os.path.splitext(files[0])[0], source=files[0], files=files)
+            for f in files:
+                with open(os.path.join(self.dir, f), 'wb') as fp:
+                    fp.write(LR_XMP if f.lower().endswith('.xmp') else b'raw-bytes-' + f.encode())
+        return pcs.batch_features(self.rows(specs))
+
+    def photo_hashes(self):
+        import hashlib
+        out = {}
+        for f in os.listdir(self.dir):
+            if not f.lower().endswith(('.xmp', '.csv')):
+                with open(os.path.join(self.dir, f), 'rb') as fp:
+                    out[f] = hashlib.sha256(fp.read()).hexdigest()
+        return out
+
+    def read(self, name):
+        with open(os.path.join(self.dir, name), 'rb') as fp:
+            return fp.read()
+
+    def test_new_xmp_for_raw(self):
+        rows = self.make([['A.ARW', 'A.JPG']], [dict(skin=7, main=5)])
+        before = self.photo_hashes()
+        plan, skipped = pcs.plan_xmp(rows)
+        self.assertEqual((len(plan), skipped), (1, []))
+        self.assertEqual(plan[0]['xmp'], os.path.join(self.dir, 'A.xmp'))
+        done, errors, log = pcs.apply_xmp(plan, self.dir)
+        self.assertEqual((len(done), errors), (1, []))
+        x = pcs.read_xmp(self.read('A.xmp'))
+        self.assertEqual(x['rating'], str(rows[0]['stars']))
+        self.assertEqual(x['label'], 'Red')  # 只有一張，一定是代表張
+        self.assertIn('舞台色彩|膚色|粉', x['hier'])
+        self.assertIn('舞台色彩|整體|藍', x['hier'])
+        self.assertIn('舞台色彩|段落|S01', x['hier'])
+        self.assertIn('粉', x['subject'])
+        self.assertEqual(self.photo_hashes(), before)  # 照片本身完全沒動
+
+    def test_merge_keeps_develop_settings_and_user_values(self):
+        rows = self.make([['B.ARW', 'B.xmp']], [dict(skin=7)])
+        done, errors, _ = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual((done[0][1], sorted(done[0][2]), errors), ('merged', ['Label', 'Rating'], []))
+        new = self.read('B.xmp')
+        x = pcs.read_xmp(new)
+        self.assertEqual((x['rating'], x['label']), ('4', 'Green'))  # 使用者原本的星等、色標保留
+        self.assertIn('婚禮', x['subject'])
+        self.assertIn('活動|婚禮', x['hier'])
+        self.assertIn('舞台色彩|膚色|粉', x['hier'])
+        added = {h.split('|')[-1] for h in x['hier'] if h.startswith('舞台色彩|')} - set(pcs.read_xmp(LR_XMP)['subject'])
+        self.assertEqual(canonical_without_ours(new, added), canonical_without_ours(LR_XMP))  # 其他內容完全一樣
+        import xml.etree.ElementTree as ET
+        crs = '{http://ns.adobe.com/camera-raw-settings/1.0/}'
+        rdf = '{http://www.w3.org/1999/02/22-rdf-syntax-ns#}'
+        old_d, new_d = ET.fromstring(LR_XMP).find('.//' + rdf + 'Description'), ET.fromstring(new).find('.//' + rdf + 'Description')
+        self.assertEqual({k: v for k, v in old_d.attrib.items() if k.startswith(crs)},
+                         {k: v for k, v in new_d.attrib.items() if k.startswith(crs)})
+        self.assertEqual(new_d.get(crs + 'Look'), 'A & B\n第二行\ttab')  # 換行、tab 沒被改成空白
+
+    def test_fill_empty_rating_and_zero(self):
+        data = LR_XMP.replace(b'xmp:Rating="4"', b'xmp:Rating="0"').replace(b'   xmp:Label="Green"\n', b'')
+        new, kept = pcs.merge_xmp(data, {'rating': 3, 'label': 'Red', 'keywords': []})
+        x = pcs.read_xmp(new)
+        self.assertEqual((x['rating'], x['label'], kept), ('3', 'Red', []))
+
+    def test_rewrite_replaces_old_keywords_only(self):
+        first, _ = pcs.merge_xmp(LR_XMP, {'rating': None, 'label': None,
+                                          'keywords': ['舞台色彩|膚色|粉', '舞台色彩|整體|藍', '舞台色彩|段落|S01']})
+        second, _ = pcs.merge_xmp(first, {'rating': None, 'label': None,
+                                          'keywords': ['舞台色彩|膚色|紅', '舞台色彩|整體|藍', '舞台色彩|段落|S02']})
+        x = pcs.read_xmp(second)
+        ours = [h for h in x['hier'] if h.startswith('舞台色彩|')]
+        self.assertEqual(sorted(ours), sorted(['舞台色彩|膚色|紅', '舞台色彩|整體|藍', '舞台色彩|段落|S02']))
+        self.assertNotIn('粉', x['subject'])
+        self.assertNotIn('S01', x['subject'])
+        self.assertIn('藍', x['subject'])  # 使用者自己的「色彩|藍」還在用，不能刪
+        self.assertEqual(x['subject'].count('藍'), 1)
+        self.assertIn('婚禮', x['subject'])
+        self.assertEqual(pcs.merge_xmp(second, {'rating': None, 'label': None,
+                                               'keywords': ['舞台色彩|膚色|紅', '舞台色彩|整體|藍', '舞台色彩|段落|S02']})[0],
+                         second)  # 結果一樣時內容完全不變（不會每次都重寫）
+
+    def test_second_run_writes_nothing(self):
+        """結果一樣時，第二次寫入不會動到任何檔案（新建的 .xmp 也一樣）"""
+        rows = self.make([['Q.ARW'], ['R.ARW', 'R.xmp']])
+        done, _, _ = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual(len(done), 2)
+        rows = pcs.batch_features(self.rows([dict(r, files=r['files'] + (['Q.xmp'] if r['source'] == 'Q.ARW' else []))
+                                             for r in rows]))
+        done, errors, log = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual((done, errors, log), ([], [], None))
+
+    def test_undo_restores_exactly(self):
+        rows = self.make([['C.ARW'], ['D.ARW', 'D.xmp']])
+        before = {f: self.read(f) for f in os.listdir(self.dir)}
+        done, errors, log = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual(len(done), 2)
+        self.assertTrue(os.path.exists(os.path.join(self.dir, 'C.xmp')))
+        self.assertEqual(pcs.latest_log(self.dir), log)
+        n, errs = pcs.undo_log(log)
+        self.assertEqual((n, errs), (2, []))
+        after = {f: self.read(f) for f in os.listdir(self.dir) if not f.startswith(pcs.LOG_PREFIX)}
+        self.assertEqual(after, before)  # 新建的刪掉、合併的逐位元組還原
+
+    def test_undo_skips_files_changed_later(self):
+        rows = self.make([['E.ARW']])
+        done, errors, log = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        path = os.path.join(self.dir, 'E.xmp')
+        with open(path, 'ab') as fp:
+            fp.write(b'<!-- Lightroom changed this -->')
+        n, errs = pcs.undo_log(log)
+        self.assertEqual((n, len(errs)), (0, 1))
+        self.assertTrue(os.path.exists(path))  # 被改過的不刪
+
+    def test_disabled_features_not_written(self):
+        rows = self.make([['F.ARW']], [dict(person='P1')])
+        rows[0]['bright'] = '中'
+        rows[0]['person'] = 'P1'
+        on = {'stars': False, 'rep': False, 'person': False, 'bright': False}
+        f = pcs.xmp_fields(rows[0], on)
+        self.assertEqual((f['rating'], f['label']), (None, None))
+        self.assertFalse([k for k in f['keywords'] if '|人物|' in k or '|亮度|' in k])
+        f = pcs.xmp_fields(rows[0])
+        self.assertIn('舞台色彩|人物|P1', f['keywords'])
+        self.assertIn('舞台色彩|亮度|中', f['keywords'])
+        new, _ = pcs.merge_xmp(None, pcs.xmp_fields(rows[0], on))
+        x = pcs.read_xmp(new)
+        self.assertEqual((x['rating'], x['label']), ('', ''))
+
+    def test_jpg_png_tiff_dng_not_written(self):
+        rows = self.make([['G.JPG'], ['H.png'], ['I.tif'], ['J.DNG'], ['K.NEF']])
+        plan, skipped = pcs.plan_xmp(rows)
+        self.assertEqual([p['source'] for p in plan], ['K.NEF'])
+        self.assertEqual(sorted(s for s, _ in skipped), ['G.JPG', 'H.png', 'I.tif', 'J.DNG'])
+        self.assertTrue(pcs.xmp_summary(rows[0]).startswith('（JPG'))
+
+    def test_outside_folder_refused(self):
+        other = tempfile.mkdtemp()
+        try:
+            plan = [{'xmp': os.path.join(other, 'X.xmp'), 'fields': {'rating': 1, 'label': None, 'keywords': []},
+                     'source': 'X.ARW'}]
+            done, errors, log = pcs.apply_xmp(plan, self.dir)
+            self.assertEqual((done, log), ([], None))
+            self.assertFalse(os.path.exists(os.path.join(other, 'X.xmp')))
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_nothing_written_when_log_cannot_be_written(self):
+        import builtins
+        from unittest import mock
+        rows = self.make([['L.ARW']])
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kw):
+            if pcs.LOG_PREFIX in str(path):
+                raise OSError('No space left on device')
+            return real_open(path, *args, **kw)
+        with mock.patch('builtins.open', fake_open):
+            done, errors, log = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual((done, log, len(errors)), ([], None, 1))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'L.xmp')))
+
+    def test_broken_xmp_left_untouched(self):
+        rows = self.make([['M.ARW']])
+        with open(os.path.join(self.dir, 'M.xmp'), 'wb') as fp:
+            fp.write(b'<x:xmpmeta broken')
+        rows[0]['files'] = ['M.ARW', 'M.xmp']
+        done, errors, _ = pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual((done, len(errors)), ([], 1))
+        self.assertEqual(self.read('M.xmp'), b'<x:xmpmeta broken')
+
+    def test_tampered_xmp_log_rejected(self):
+        outside = tempfile.NamedTemporaryFile(suffix='.xmp', delete=False)
+        outside.close()
+        log = os.path.join(self.dir, pcs.LOG_PREFIX + 'XMP_x.csv')
+        with open(log, 'w', newline='', encoding='utf-8-sig') as fp:
+            csv.writer(fp).writerows([['action', 'xmp', 'sha_before', 'sha_after', 'original_base64'],
+                                      ['created', outside.name, '', pcs._sha(b''), '']])
+        with self.assertRaises(PermissionError):
+            pcs.undo_log(log)
+        self.assertTrue(os.path.exists(outside.name))
+        os.remove(outside.name)
+
+    def test_rename_keeps_xmp_paired(self):
+        rows = self.make([['N.ARW']], [dict(skin=7, main=5)])
+        pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        groups = pcs.collect_groups(self.dir)
+        self.assertEqual(groups[0]['files'], ['N.ARW', 'N.xmp'])  # 改檔名時 .xmp 會跟著 RAW 一起改
+
+    def test_restore_ignores_xmp_logs(self):
+        rows = self.make([['O.ARW']])
+        pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
+        self.assertEqual(pcs._log_mappings([self.dir]), {})
