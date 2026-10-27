@@ -36,6 +36,56 @@ class ColorTests(unittest.TestCase):
     def test_no_face(self):
         self.assertEqual(pcs.analyze_skin(solid((255, 0, 0)))[0], pcs.NOFACE)
 
+    def test_blown_out_is_white_not_dark(self):
+        """幾乎全過曝的照片要判成白光，不能因為爆點被排除就變成「暗」"""
+        img = solid((255, 255, 255))
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+        img[:40, :60] = (255, 80, 0)  # 角落一小塊藍
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+        img = solid((50, 45, 60))
+        img[:210] = 252  # 上面 70% 過曝、下面暗沉舞台
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+        img = solid((0, 0, 0))
+        img[:, :160] = 250  # 黑底加一大片白光
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+
+    def test_light_burst_does_not_win(self):
+        """偏暗的藍色舞台上，25% 的燈光爆點不能把整張照片拉成白（舊版會判成白）"""
+        img = solid((128, 45, 15))
+        img[:75] = 250  # 25% 爆點
+        key, ratio, top, hl = pcs.analyze_overall(img, return_highlight=True)
+        self.assertEqual(pcs.label(key), '藍')
+        self.assertAlmostEqual(hl, 0.25, places=2)
+        self.assertEqual(pcs.label(top[0][0]), '藍')
+        self.assertAlmostEqual(sum(p for _, p in top), 1.0, places=2)  # 比例是同一套票數的佔比
+
+    def test_no_cliff_on_blue_stage(self):
+        """爆點比例增加時，藍色舞台不會比舊版更早變成白（舊版約 45% 才變白）"""
+        for f in (0.1, 0.2, 0.3, 0.35, 0.4, 0.44):
+            img = solid((220, 90, 30))
+            img[:int(300 * f)] = 250
+            self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '藍', f)
+        img = solid((220, 90, 30))
+        img[:180] = 250  # 爆點佔 60%：大部分是白光，應判白（爆點票數已恢復）
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+
+    def test_dim_grey_fallback(self):
+        """只有暗沉灰色時：有爆點算白光，沒有爆點算暗"""
+        img = solid((70, 70, 70))  # 亮度約 0.27，不算白光
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '暗')
+        img[:30, :40] = 255  # 1% 爆點
+        self.assertEqual(pcs.label(pcs.analyze_overall(img)[0]), '白')
+
+    def test_highlight_fraction(self):
+        """爆點比例 = 爆點佔亮區的比例，會出現在分析結果裡"""
+        img = solid((0, 0, 0))
+        img[:, :100] = (255, 80, 0)   # 25% 藍光
+        img[:, 100:120] = 255         # 5% 爆點
+        key, _, _, hl = pcs.analyze_overall(img, return_highlight=True)
+        self.assertEqual(pcs.label(key), '藍')
+        self.assertAlmostEqual(hl, 20 / 120, places=2)
+        self.assertEqual(len(pcs.analyze_overall(img)), 3)  # 預設回傳格式不變
+
 
 class RenameTests(unittest.TestCase):
     def setUp(self):
