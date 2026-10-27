@@ -13,6 +13,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
                前 = 優先項目（預設膚色）、後 = 另一項，數字決定排序。
                匯入 Lightroom Classic 後用「檔案名稱」排序，就會依顏色排好。
      分資料夾：DSC_1234.NEF  ->  膚色6藍/整體7紫/DSC_1234.NEF
+     寫入 Lightroom 標籤：DSC_1234.NEF 旁邊的 DSC_1234.xmp 加上星等、代表張色標、「舞台色彩|…」關鍵字（不改檔名）
 
   - RAW + JPG + XMP 同名檔會一起改名
   - 每次執行會在資料夾內留下紀錄 CSV，可一鍵復原
@@ -23,7 +24,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
 
 用法：
   圖形介面：  python photo_color_sorter.py [資料夾]
-  命令列：    python photo_color_sorter.py <資料夾> --preview|--apply [--output rename|folder]
+  命令列：    python photo_color_sorter.py <資料夾> --preview|--apply [--output rename|folder|xmp]
               [--mode both|skin|main] [--order skin|main] [--no-digits] [-r]
               [--performer] [--csv 結果.csv] [--time-seq] [--report [報告.txt]]
               [--stage standard|pale] [--scenes auto|manual|both --splits "2921,3040"]
@@ -934,6 +935,23 @@ def wb_text(r):
     return '色溫%+d 色調%+d' % (round(r['wb_temp']), round(r['wb_tint']))
 
 
+def people_text(n):
+    """偵測到的人數（臉數）。5 人以上合併成「5人以上」，分組時才不會太碎"""
+    return '%d人以上' % PEOPLE_MAX if n >= PEOPLE_MAX else '%d人' % n
+
+
+PEOPLE_MAX = 5
+
+
+def people_dist(rows):
+    """「0人 120、1人 300、2人 80…」：每種人數各有幾張"""
+    c = {}
+    for r in rows:
+        k = min(r['faces'], PEOPLE_MAX)
+        c[k] = c.get(k, 0) + 1
+    return '、'.join('%s %d' % (people_text(k), c[k]) for k in sorted(c))
+
+
 def build_report(rows, mode='both', order='skin', performer=False, features=None):
     """分析報告：整批結果的統計，以及需要注意的地方。回傳 (摘要行清單, 提醒清單)。
     提醒依「⚠ 需要注意」與「ℹ 參考」分級，讓使用者知道這次的結果可不可靠、該怎麼調。"""
@@ -954,6 +972,7 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
         return '、'.join('%s %d' % (label(k), v) for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
     lines.append('整體主色：' + dist('main'))
     lines.append('膚色：' + dist('skin'))
+    lines.append('偵測到的人數：' + people_dist(ok))
     exif = sum(r['time_src'] == 'EXIF' for r in ok)
     lines.append('拍攝時間：%d 張讀到 EXIF（%.0f%%）' % (exif, pct(exif)))
     scenes = len({r['scene'] for r in ok})
@@ -1061,14 +1080,15 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
         wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '人物', '亮度',
-                     '調色起點建議', '臉數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
+                     '調色起點建議', '人數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
                      '結果', '錯誤'])
         for r in rows:
             if r.get('error'):
                 wr.writerow([_cell(r['source'])] + [''] * 19 + [r['error']])
                 continue
             clean = strip_prefix(r['source'])
-            new = (os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
+            new = (xmp_summary(r, on) if output == 'xmp'
+                   else os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
                    else build_prefix(r, mode, order, digits, time_seq) + clean)
             wr.writerow([_cell(r['source']), r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
                          'S%02d' % r['scene'], '★' if r['rep'] and on['rep'] else '', r['sharp_score'],
@@ -1199,9 +1219,23 @@ def latest_log(folder):
     return os.path.join(folder, max(logs, key=order))
 
 
+def _mark_undone(log_path):
+    done_path, k = log_path[:-4] + '_已復原.csv', 1
+    while os.path.exists(done_path):  # 不覆蓋舊的已復原紀錄
+        k += 1
+        done_path = log_path[:-4] + '_已復原_%d.csv' % k
+    os.rename(log_path, done_path)
+
+
 def undo_log(log_path):
     with open(log_path, newline='', encoding='utf-8-sig') as fp:
-        rows = list(csv.DictReader(fp))
+        reader = csv.DictReader(fp)
+        rows = list(reader)
+        is_xmp = 'action' in (reader.fieldnames or [])
+    if is_xmp:  # 寫入 Lightroom 標籤的紀錄
+        done, errors = _undo_xmp(rows, log_path)
+        _mark_undone(log_path)  # 和改名一樣標成已復原；沒復原的（被 Lightroom 改過）列在 errors 裡
+        return done, errors
     base = os.path.dirname(os.path.abspath(log_path))
     # 安全檢查：只處理紀錄檔所在資料夾內的路徑，避免被竄改的紀錄檔動到其他位置的檔案
     rows = [r for r in rows if r.get('old') and r.get('new')]
@@ -1222,11 +1256,7 @@ def undo_log(log_path):
         while is_inside(d, base) and FOLDER_RE.match(os.path.basename(d)) and os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
             d = os.path.dirname(d)
-    done_path, k = log_path[:-4] + '_已復原.csv', 1
-    while os.path.exists(done_path):  # 不覆蓋舊的已復原紀錄
-        k += 1
-        done_path = log_path[:-4] + '_已復原_%d.csv' % k
-    os.rename(log_path, done_path)
+    _mark_undone(log_path)
     return done, errors
 
 
@@ -1297,6 +1327,382 @@ def plan_restore(folder, log_folders=(), recursive=False):
     return plan, by_log
 
 
+# ---------------------------------------------------------------- 寫入 Lightroom 標籤（XMP）
+
+XMP_ROOT = '舞台色彩'      # 關鍵字都放在這個上層之下，在 Lightroom 可以整組刪掉
+REP_LABEL = 'Red'          # 代表張的色標（Lightroom 預設色標組的英文名稱）
+XMP_SKIP_EXTS = IMG_EXTS | {'.dng'}  # Lightroom 不讀這些格式旁邊的 .xmp（要寫進照片本身），本工具不寫
+XMP_SKIP_REASON = 'Lightroom 不讀 JPG、PNG、TIFF、DNG 旁邊的 .xmp，要改照片檔案本身才行；為了不動到照片，這些格式不寫入，請改用「改檔名」'
+_NS = {'x': 'adobe:ns:meta/', 'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+       'xmp': 'http://ns.adobe.com/xap/1.0/', 'dc': 'http://purl.org/dc/elements/1.1/',
+       'lr': 'http://ns.adobe.com/lightroom/1.0/'}
+_XMLNS = 'http://www.w3.org/2000/xmlns/'
+_NEW_XMP = ('<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Photo Color Sorter">\n'
+            ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
+            '  <rdf:Description rdf:about=""/>\n'
+            ' </rdf:RDF>\n'
+            '</x:xmpmeta>\n')
+
+
+def xmp_fields(r, features=None):
+    """一張照片要寫進 XMP 的內容：{'rating': 1~3 或 None, 'label': 色標或 None, 'keywords': [階層關鍵字]}。
+    關掉的挑圖功能不寫。顏色與段落一律寫（它們是分類本身，不是挑圖功能）"""
+    on = dict(ALL_FEATURES, **(features or {}))
+    kw = ['%s|膚色|%s' % (XMP_ROOT, label(r['skin'])), '%s|整體|%s' % (XMP_ROOT, label(r['main'])),
+          '%s|段落|S%02d' % (XMP_ROOT, r['scene']), '%s|人數|%s' % (XMP_ROOT, people_text(r['faces']))]
+    if on['person'] and r.get('person'):
+        kw.append('%s|人物|%s' % (XMP_ROOT, r['person']))
+    if on['bright'] and r.get('bright'):
+        kw.append('%s|亮度|%s' % (XMP_ROOT, r['bright']))
+    return {'rating': r.get('stars') if on['stars'] else None,
+            'label': REP_LABEL if on['rep'] and r.get('rep') else None, 'keywords': kw}
+
+
+def xmp_target(r):
+    """這組照片要寫的 .xmp 路徑；沒有 Lightroom 會讀 .xmp 的 RAW 時回傳 None"""
+    raws = [f for f in r['files'] if os.path.splitext(f)[1].lower() in RAW_EXTS - XMP_SKIP_EXTS]
+    if not raws:
+        return None
+    stem = os.path.splitext(sorted(raws)[0])[0]
+    for f in r['files']:  # 已有同名 .xmp（大小寫可能不同）就沿用它
+        if f.lower() == (stem + '.xmp').lower():
+            return os.path.join(r['dir'], f)
+    return os.path.join(r['dir'], stem + '.xmp')
+
+
+def xmp_summary(r, features=None):
+    """表格「結果」欄的摘要，例如「★★ 紅標 粉/藍 S03」"""
+    if xmp_target(r) is None:
+        return '（%s 不寫入）' % os.path.splitext(r['source'])[1].lstrip('.').upper()
+    f = xmp_fields(r, features)
+    parts = ['★' * f['rating']] if f['rating'] else []
+    if f['label']:
+        parts.append('紅標')
+    parts.append('%s/%s' % (label(r['skin']), label(r['main'])))
+    parts.append('S%02d' % r['scene'])
+    parts.append(people_text(r['faces']))
+    return ' '.join(parts)
+
+
+def plan_xmp(rows, features=None):
+    """回傳 (計畫 [{'xmp', 'fields', 'source'}], 不寫入 [(檔名, 原因)])"""
+    plan, skipped = [], []
+    for r in rows:
+        if r.get('error'):
+            continue
+        path = xmp_target(r)
+        if path is None:
+            skipped.append((r['source'], XMP_SKIP_REASON))
+        else:
+            plan.append({'xmp': path, 'fields': xmp_fields(r, features), 'source': r['source']})
+    return plan, skipped
+
+
+def _xml_escape(s, attr=False):
+    s = s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    if attr:  # 屬性裡的換行、tab 要用字元參照，否則重新讀取時會變成空白
+        s = s.replace('"', '&quot;').replace('\n', '&#xA;').replace('\r', '&#xD;').replace('\t', '&#x9;')
+    return s
+
+
+def _xml_write(node, out):
+    """自己序列化 minidom 節點：屬性順序、命名空間前綴照原樣，只做必要的跳脫"""
+    t = node.nodeType
+    if t == node.ELEMENT_NODE:
+        out.append('<' + node.tagName)
+        attrs = [node.attributes.item(i) for i in range(node.attributes.length)]
+        # 命名空間宣告放前面（讀回來時解析器也是這個順序），同樣的內容每次輸出都一樣
+        attrs = [a for a in attrs if a.name.startswith('xmlns')] + [a for a in attrs if not a.name.startswith('xmlns')]
+        for a in attrs:
+            out.append(' %s="%s"' % (a.name, _xml_escape(a.value, True)))
+        if not node.childNodes:
+            out.append('/>')
+            return
+        out.append('>')
+        for c in node.childNodes:
+            _xml_write(c, out)
+        out.append('</%s>' % node.tagName)
+    elif t == node.TEXT_NODE:
+        out.append(_xml_escape(node.data))
+    elif t == node.CDATA_SECTION_NODE:
+        out.append('<![CDATA[%s]]>' % node.data)
+    elif t == node.COMMENT_NODE:
+        out.append('<!--%s-->' % node.data)
+    elif t == node.PROCESSING_INSTRUCTION_NODE:
+        out.append('<?%s %s?>' % (node.target, node.data))
+
+
+def _ns_prefix(el, uri, want):
+    """el 上（或上層）綁定 uri 的前綴；沒有就在 el 上宣告一個"""
+    n = el
+    while n is not None and n.nodeType == n.ELEMENT_NODE:
+        for i in range(n.attributes.length):
+            a = n.attributes.item(i)
+            if a.name.startswith('xmlns:') and a.value == uri:
+                return a.name[6:]
+        n = n.parentNode
+    p, k = want, 1
+    while el.hasAttribute('xmlns:' + p):
+        k += 1
+        p = '%s%d' % (want, k)
+    el.setAttributeNS(_XMLNS, 'xmlns:' + p, uri)
+    return p
+
+
+def _children(el, uri, local):
+    return [c for c in el.childNodes if c.nodeType == c.ELEMENT_NODE and c.namespaceURI == uri and c.localName == local]
+
+
+def _text(el):
+    return ''.join(c.data for c in el.childNodes if c.nodeType in (c.TEXT_NODE, c.CDATA_SECTION_NODE)).strip()
+
+
+def _parse_xmp(data):
+    from xml.dom import minidom
+    doc = minidom.parseString(data)
+    rdfs = doc.getElementsByTagNameNS(_NS['rdf'], 'RDF')
+    if not rdfs:
+        raise ValueError('不是 XMP 格式（找不到 rdf:RDF）')
+    rdf = rdfs[0]
+    descs = _children(rdf, _NS['rdf'], 'Description')
+    if not descs:
+        d = doc.createElementNS(_NS['rdf'], _ns_prefix(rdf, _NS['rdf'], 'rdf') + ':Description')
+        d.setAttributeNS(_NS['rdf'], _ns_prefix(rdf, _NS['rdf'], 'rdf') + ':about', '')
+        rdf.appendChild(d)
+        descs = [d]
+    return doc, descs
+
+
+def _simple_prop(descs, uri, local):
+    """(Description, 屬性或子元素, 目前的值) — 屬性形式 xmp:Rating="3" 或元素形式 <xmp:Rating>3</xmp:Rating>"""
+    for d in descs:
+        if d.hasAttributeNS(uri, local):
+            return d, d.getAttributeNodeNS(uri, local), d.getAttributeNS(uri, local).strip()
+        els = _children(d, uri, local)
+        if els:
+            return d, els[0], _text(els[0])
+    return None, None, ''
+
+
+def _bag(doc, descs, uri, local, want_prefix):
+    """找到（或建立）dc:subject / lr:hierarchicalSubject 的 rdf:Bag"""
+    for d in descs:
+        for el in _children(d, uri, local):
+            bags = _children(el, _NS['rdf'], 'Bag')
+            if bags:
+                return bags[0]
+            bag = doc.createElementNS(_NS['rdf'], _ns_prefix(el, _NS['rdf'], 'rdf') + ':Bag')
+            el.appendChild(bag)
+            return bag
+    d = descs[0]
+    el = doc.createElementNS(uri, _ns_prefix(d, uri, want_prefix) + ':' + local)
+    bag = doc.createElementNS(_NS['rdf'], _ns_prefix(d, _NS['rdf'], 'rdf') + ':Bag')
+    el.appendChild(bag)
+    d.appendChild(el)
+    return bag
+
+
+def read_xmp(data):
+    """讀出 XMP 裡的星等、色標、關鍵字（給測試與比對挑圖習慣用）"""
+    doc, descs = _parse_xmp(data)
+    out = {'rating': _simple_prop(descs, _NS['xmp'], 'Rating')[2], 'label': _simple_prop(descs, _NS['xmp'], 'Label')[2]}
+    for key, uri, local in (('subject', _NS['dc'], 'subject'), ('hier', _NS['lr'], 'hierarchicalSubject')):
+        vals = []
+        for d in descs:
+            for el in _children(d, uri, local):
+                for bag in _children(el, _NS['rdf'], 'Bag'):
+                    vals += [_text(li) for li in _children(bag, _NS['rdf'], 'li')]
+        out[key] = vals
+    return out
+
+
+def merge_xmp(data, fields):
+    """把 fields 合併進 XMP（data=None 表示新建）。回傳 (新內容 bytes, 保留的欄位清單)。
+    - 已有的星等（不是 0）和色標保留，只補空的
+    - 只動 xmp:Rating、xmp:Label，以及「舞台色彩」底下的關鍵字；其他內容（crs: 修圖設定等）照原樣輸出
+    - 重新寫入時先移除上次寫的「舞台色彩|…」，所以不會越寫越多"""
+    if data is None:
+        data = _NEW_XMP.encode('utf-8')
+    bom = b'\xef\xbb\xbf' if data.startswith(b'\xef\xbb\xbf') else b''
+    body = data[len(bom):]
+    decl = b''
+    if body.lstrip().startswith(b'<?xml'):
+        start = body.index(b'<?xml')
+        decl = body[:body.index(b'?>', start) + 2]
+    doc, descs = _parse_xmp(data)
+    kept = []
+    for key, local in (('rating', 'Rating'), ('label', 'Label')):
+        val = fields.get(key)
+        if val is None:
+            continue
+        d, node, cur = _simple_prop(descs, _NS['xmp'], local)
+        if cur and not (key == 'rating' and cur == '0'):  # Lightroom 的 0 星 = 沒有評等
+            kept.append(local)
+            continue
+        if node is None:
+            descs[0].setAttributeNS(_NS['xmp'], _ns_prefix(descs[0], _NS['xmp'], 'xmp') + ':' + local, str(val))
+        elif node.nodeType == node.ATTRIBUTE_NODE:
+            node.value = str(val)
+        else:
+            for c in list(node.childNodes):
+                node.removeChild(c)
+            node.appendChild(doc.createTextNode(str(val)))
+    new_kw = list(fields.get('keywords') or [])
+    hier = _bag(doc, descs, _NS['lr'], 'hierarchicalSubject', 'lr')
+    subj = _bag(doc, descs, _NS['dc'], 'subject', 'dc')
+    hier_li = _children(hier, _NS['rdf'], 'li')
+    ours_old = [li for li in hier_li if _text(li).startswith(XMP_ROOT + '|')]
+    others = [_text(li) for li in hier_li if li not in ours_old]
+    # dc:subject 放最末層的字（Lightroom 自己也這樣寫）；只移除「上次寫的、而且使用者其他階層關鍵字沒用到」的字
+    removable = {_text(li).split('|')[-1] for li in ours_old} - {h.split('|')[-1] for h in others}
+    for li in ours_old:
+        hier.removeChild(li)
+    for li in _children(subj, _NS['rdf'], 'li'):
+        if _text(li) in removable:
+            subj.removeChild(li)
+    rdf_p = hier.tagName.split(':')[0] if ':' in hier.tagName else 'rdf'
+    have_h = set(others)
+    for k in new_kw:
+        if k not in have_h:
+            li = doc.createElementNS(_NS['rdf'], rdf_p + ':li')
+            li.appendChild(doc.createTextNode(k))
+            hier.appendChild(li)
+            have_h.add(k)
+    have_s = {_text(li) for li in _children(subj, _NS['rdf'], 'li')}
+    rdf_p = subj.tagName.split(':')[0] if ':' in subj.tagName else 'rdf'
+    for leaf in [k.split('|')[-1] for k in new_kw]:
+        if leaf not in have_s:
+            li = doc.createElementNS(_NS['rdf'], rdf_p + ':li')
+            li.appendChild(doc.createTextNode(leaf))
+            subj.appendChild(li)
+            have_s.add(leaf)
+    out = []
+    for n in doc.childNodes:
+        _xml_write(n, out)
+        out.append('\n')
+    text = ''.join(out).encode('utf-8')
+    return bom + (decl + b'\n' if decl else b'') + text, kept
+
+
+def _new_log_path(log_dir, kind=''):
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    base = os.path.join(log_dir, LOG_PREFIX + kind + stamp)
+    path, n = base + '.csv', 1
+    while os.path.exists(path) or os.path.exists(path[:-4] + '_已復原.csv'):  # 同一秒內再執行也不撞名
+        n += 1
+        path = '%s_%d.csv' % (base, n)
+    return path
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest() if data is not None else ''
+
+
+def apply_xmp(plan, log_dir):
+    """依計畫寫入 .xmp。回傳 (完成 [(路徑, 'created'|'merged', 保留的欄位)], 失敗 [(路徑, 原因)], 紀錄檔)。
+    和改名一樣：先建立紀錄檔，寫不了就一個都不寫；每一筆先記下原本內容再寫檔，中途中斷也能復原。
+    寫檔用暫存檔再換名，不會留下寫一半的 .xmp"""
+    import base64
+    done, errors = [], []
+    if not plan:
+        return done, errors, None
+    log_path = _new_log_path(log_dir, 'XMP_')
+    try:
+        fp = open(log_path, 'w', newline='', encoding='utf-8-sig')
+        writer = csv.writer(fp)
+        writer.writerow(['action', 'xmp', 'sha_before', 'sha_after', 'original_base64'])
+        fp.flush()
+    except OSError as e:
+        return done, [(p['xmp'], '無法建立紀錄檔，為了能復原所以沒有寫入：%s' % e) for p in plan], None
+    try:
+        for i, item in enumerate(plan):
+            path = item['xmp']
+            try:
+                if not is_inside(path, log_dir):
+                    raise PermissionError('路徑不在所選資料夾內')
+                old = None
+                if os.path.exists(path):
+                    if not os.path.isfile(path):
+                        raise IsADirectoryError('同名的不是檔案')
+                    with open(path, 'rb') as f:
+                        old = f.read()
+                try:
+                    new, kept = merge_xmp(old, item['fields'])
+                except Exception as e:
+                    raise ValueError('原本的 .xmp 無法解析，沒有改動：%s' % e)
+                if new == old:
+                    continue  # 內容一樣（重複執行），不用寫
+                action = 'merged' if old is not None else 'created'
+            except Exception as e:
+                errors.append((path, str(e)))
+                continue
+            try:  # 先記下原本的內容，再寫檔
+                writer.writerow([action, path, _sha(old), _sha(new), base64.b64encode(old).decode() if old else ''])
+                fp.flush()
+            except OSError as e:
+                errors += [(p['xmp'], '紀錄檔寫入失敗，已停止：%s' % e) for p in plan[i:]]
+                break
+            tmp = path + '.pcs_tmp'
+            try:
+                with open(tmp, 'wb') as f:
+                    f.write(new)
+                os.replace(tmp, path)
+            except OSError as e:
+                errors.append((path, '檔案是唯讀，或正被其他程式（例如 Lightroom）使用，沒有寫入'
+                               if isinstance(e, PermissionError) else str(e)))
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                continue
+            done.append((path, action, kept))
+    finally:
+        fp.close()
+    if not done:
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
+    return done, errors, (log_path if done else None)
+
+
+def _undo_xmp(rows, log_path):
+    """復原 XMP 寫入：新建的刪除、合併的還原成寫入前的內容。
+    只處理「內容還是本工具寫的樣子」的檔案；之後被 Lightroom 或其他程式改過的不動，列在失敗裡"""
+    import base64
+    base = os.path.dirname(os.path.abspath(log_path))
+    rows = [r for r in rows if r.get('xmp') and r.get('action') in ('created', 'merged')]
+    unsafe = [r for r in rows if not is_inside(r['xmp'], base) or not r['xmp'].lower().endswith('.xmp')]
+    if unsafe:
+        raise PermissionError('紀錄檔中有 %d 筆路徑不在此資料夾內，為了安全已停止復原' % len(unsafe))
+    done, errors = 0, []
+    for r in reversed(rows):
+        path = r['xmp']
+        try:
+            cur = None
+            if os.path.isfile(path):
+                with open(path, 'rb') as f:
+                    cur = f.read()
+            if _sha(cur) == r['sha_before']:
+                continue  # 這一筆當時沒寫成功，或已經復原過
+            if _sha(cur) != r['sha_after']:
+                raise RuntimeError('寫入後被其他程式改過（例如 Lightroom），為了不蓋掉那些變更，沒有復原')
+            if r['action'] == 'created':
+                os.remove(path)
+            else:
+                original = base64.b64decode(r['original_base64'])
+                if _sha(original) != r['sha_before']:
+                    raise RuntimeError('紀錄檔裡的原本內容不完整，沒有復原')
+                tmp = path + '.pcs_tmp'
+                with open(tmp, 'wb') as f:
+                    f.write(original)
+                os.replace(tmp, path)
+            done += 1
+        except Exception as e:
+            errors.append((path, str(e)))
+    return done, errors
+
+
 def run_analysis(groups, progress=None, workers=None, stage='standard', person=True):
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     results = []
@@ -1348,7 +1754,7 @@ def run_gui(initial_folder=None):
 
     # 記住上次的設定（存在使用者資料夾的 .photo_color_sorter.json）
     saved = load_settings()
-    allowed = {'output': ('rename', 'folder'), 'mode': ('both', 'skin', 'main'), 'order': ('skin', 'main'),
+    allowed = {'output': ('rename', 'folder', 'xmp'), 'mode': ('both', 'skin', 'main'), 'order': ('skin', 'main'),
                'sort_by': ('time', 'name', 'color', 'person', 'stars'), 'stage': tuple(STAGE_PRESETS),
                'scene_mode': ('auto', 'manual', 'both')}
     for var, k in ((output, 'output'), (mode, 'mode'), (order, 'order'), (sort_by, 'sort_by'),
@@ -1383,9 +1789,12 @@ def run_gui(initial_folder=None):
         refresh_table()
         remember()
         is_folder = output.get() == 'folder'
-        b_apply.configure(text='② 執行分資料夾' if is_folder else '② 執行改名')
+        b_apply.configure(text={'folder': '② 執行分資料夾', 'xmp': '② 寫入標籤'}.get(output.get(), '② 執行改名'))
         m_tools.entryconfig(STRIP_LABEL, state='disabled' if is_folder or state['busy'] else 'normal')
-        c_seq.state(['disabled'] if is_folder else ['!disabled'])
+        c_seq.state(['disabled'] if output.get() != 'rename' else ['!disabled'])
+        if output.get() == 'xmp' and not state['busy']:
+            status.set('寫入 Lightroom 標籤：只寫 RAW 檔旁邊的 .xmp，不改檔名。JPG、PNG、TIFF、DNG 不寫入'
+                       '（Lightroom 不讀它們旁邊的 .xmp，要改照片本身才行）')
 
     def on_feature(k):
         if (k == 'person' and feat['person'].get() and state['results'] and not state['person_done']
@@ -1451,7 +1860,7 @@ def run_gui(initial_folder=None):
     a1 = ttk.Frame(adv)
     a1.pack(fill='x')
     ttk.Label(a1, text='輸出方式：').pack(side='left')
-    for t, v in (('改檔名', 'rename'), ('分資料夾', 'folder')):
+    for t, v in (('改檔名', 'rename'), ('分資料夾', 'folder'), ('寫入 Lightroom 標籤', 'xmp')):
         ttk.Radiobutton(a1, text=t, value=v, variable=output, command=on_option).pack(side='left')
     ttk.Label(a1, text='　優先：').pack(side='left')
     for t, v in (('膚色', 'skin'), ('整體', 'main')):
@@ -1528,7 +1937,12 @@ def run_gui(initial_folder=None):
                             '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案\n'
                             '整體後的 ?：主色票數偏低，建議人工確認\n'
                             '燈光爆點：很亮又沒顏色的部分佔亮處的比例（爆點少時不參與判斷顏色）\n'
-                            '時間後的 *：沒有拍攝時間，改用檔案時間')
+                            '時間後的 *：沒有拍攝時間，改用檔案時間\n\n'
+                            '開啟照片：點「原檔名」，或在任一列按兩下／按 Enter；按右鍵可以在檔案總管中顯示\n'
+                            '人數：偵測到幾張臉（遠處太小、背對、太暗的臉不會算進去）\n\n'
+                            '寫入 Lightroom 標籤（進階設定 → 輸出方式）：把星等、代表張紅色標、'
+                            '顏色／段落／人物／亮度關鍵字（在「舞台色彩」底下）寫進 RAW 旁邊的 .xmp，不改檔名。'
+                            '已有的星等和色標會保留。JPG、PNG、TIFF、DNG 不寫入')
 
     btns = ttk.Frame(root, padding=8)
     btns.pack(fill='x')
@@ -1544,10 +1958,10 @@ def run_gui(initial_folder=None):
     # --- 預覽表格：預設只顯示挑圖最常用的欄位
     cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'person', 'bright', 'wb', 'faces', 'skin', 'skin_r',
             'main', 'main_r', 'top', 'hl', 'new')
-    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '臉數', '膚色', '膚色比例',
+    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '人數', '膚色', '膚色比例',
              '整體', '整體比例', '整體組成', '燈光爆點', '結果')
-    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 40, 45, 65, 50, 65, 160, 65, 300)
-    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'skin', 'main', 'new')
+    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 45, 45, 65, 50, 65, 160, 65, 300)
+    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'faces', 'skin', 'main', 'new')
     feat_cols = {'rep': 'rep', 'stars': 'stars', 'person': 'person', 'bright': 'bright', 'wb': 'wb'}
 
     # 燈光時間軸色帶：整場的整體主色與膚色，點一下跳到那一段
@@ -1678,6 +2092,7 @@ def run_gui(initial_folder=None):
 
     def refresh_table():
         tree.delete(*tree.get_children())
+        state['paths'] = {}  # 表格列 -> 照片完整路徑（點檔名開啟用）
         rows, sort_key = current_rows()
         f = features_now()
         grouped = group_scene.get() and sort_by.get() == 'time'
@@ -1702,20 +2117,23 @@ def run_gui(initial_folder=None):
                                          values=[vals[c] for c in cols], tags=('scenehdr',))
         for r in rows:
             if r.get('error'):
-                tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
-                            tags=('err',))
+                iid = tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
+                                  tags=('err',))
+                state['paths'][iid] = os.path.join(r['dir'], r['source'])
                 continue
             clean = strip_prefix(r['source'])
-            if output.get() == 'folder':
+            if output.get() == 'xmp':
+                new = xmp_summary(r, f)
+            elif output.get() == 'folder':
                 new = os.path.join(build_subdir(r, mode.get(), order.get(), digits.get()), clean)
             else:
                 new = build_prefix(r, mode.get(), order.get(), digits.get(), time_seq.get()) + clean
             extra = len(r['files']) - 1
-            if extra:
+            if extra and output.get() != 'xmp':
                 new += '  (+%d 個同名檔)' % extra
             top3 = ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top'])
             t = r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*')
-            tree.insert(parents.get(r['scene'], '') if grouped else '', 'end', tags=('c%d' % r[sort_key],),
+            state['paths'][tree.insert(parents.get(r['scene'], '') if grouped else '', 'end', tags=('c%d' % r[sort_key],),
                         image=swatch(r['skin'], r['main']), values=(
                 r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] and f['rep'] else '',
                 '★' * r['stars'] if f['stars'] else '', r['sharp_score'],
@@ -1723,8 +2141,52 @@ def run_gui(initial_folder=None):
                 wb_text(r) if f['wb'] else '', r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                 label(r['main']) + ('?' if r['uncertain'] else ''), '%d%%' % (r['main_ratio'] * 100), top3,
-                '%d%%' % (r.get('highlight', 0) * 100), new))
+                '%d%%' % (r.get('highlight', 0) * 100), new))] = os.path.join(r['dir'], r['source'])
         draw_timeline(rows)
+
+    def open_photo(iid, reveal=False):
+        """用 Windows 預設的看圖程式開啟照片；reveal=True 時在檔案總管中選取它"""
+        path = state.get('paths', {}).get(iid)
+        if not path:
+            return
+        import time
+        last = state.get('last_open')
+        if not reveal and last and last[0] == path and time.monotonic() - last[1] < 1.0:
+            return  # 點一下＋按兩下會連續觸發，一秒內同一張只開一次
+        state['last_open'] = (path, time.monotonic())
+        if not os.path.exists(path):
+            messagebox.showwarning('找不到照片', '這張照片已經不在原來的位置（可能改名或搬走了），請重新分析。\n\n%s' % path)
+            return
+        try:
+            if reveal:
+                import subprocess
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+            else:
+                os.startfile(path)
+        except Exception as e:
+            messagebox.showerror('無法開啟', '沒有可以開啟這種檔案的程式，或開啟失敗：\n%s' % e)
+
+    def on_tree_click(e):
+        # 點「原檔名」那一格就開啟照片；點其他地方只是選取
+        iid = tree.identify_row(e.y)
+        if iid and tree.identify_region(e.x, e.y) == 'cell' and tree.identify_column(e.x) == '#1':
+            open_photo(iid)
+
+    tree_menu = tk.Menu(root, tearoff=0)
+    tree_menu.add_command(label='開啟照片', command=lambda: open_photo(tree.focus()))
+    tree_menu.add_command(label='在檔案總管中顯示', command=lambda: open_photo(tree.focus(), reveal=True))
+
+    def on_tree_menu(e):
+        iid = tree.identify_row(e.y)
+        if iid in state.get('paths', {}):
+            tree.selection_set(iid)
+            tree.focus(iid)
+            tree_menu.tk_popup(e.x_root, e.y_root)
+
+    tree.bind('<ButtonRelease-1>', on_tree_click)
+    tree.bind('<Double-1>', lambda e: open_photo(tree.identify_row(e.y)))
+    tree.bind('<Return>', lambda e: open_photo(tree.focus()))
+    tree.bind('<Button-3>', on_tree_menu)
 
     def check_folder():
         f = folder.get().strip()
@@ -1800,6 +2262,9 @@ def run_gui(initial_folder=None):
             return
         if not same_folder(f):
             return
+        if output.get() == 'xmp':
+            do_write_xmp(f)
+            return
         is_folder = output.get() == 'folder'
         rows, _ = current_rows()  # 已套用「偏重演出者」並算好拍攝時間序號
         plan = plan_renames(rows, mode.get(), order.get(), digits.get(), output.get(), time_seq.get())
@@ -1817,6 +2282,40 @@ def run_gui(initial_folder=None):
         msg = '已%s %d 個檔案。' % (action, len(done))
         if log:
             msg += '\n紀錄檔：%s' % os.path.basename(log)
+        if errors:
+            msg += '\n\n%d 個失敗：\n' % len(errors) + '\n'.join('%s：%s' % (os.path.basename(a), b) for a, b in errors[:10])
+        status.set(msg.split('\n')[0])
+        messagebox.showinfo('完成', msg)
+
+    def do_write_xmp(f):
+        rows, _ = current_rows()
+        plan, skipped = plan_xmp(rows, features_now())
+        if not plan:
+            messagebox.showinfo('沒有可以寫入的照片', '這個資料夾沒有 RAW 檔，所以沒有可以寫入的標籤。\n\n'
+                                + XMP_SKIP_REASON + '。')
+            return
+        msg = '即將寫入 %d 張 RAW 照片的 Lightroom 標籤（星等、代表張色標、關鍵字）。' % len(plan)
+        if skipped:
+            msg += '\n另外 %d 張是 JPG／PNG／TIFF／DNG，不會寫入。' % len(skipped)
+        msg += ('\n\n・照片已經有星等或色標時，保留原本的，只補空的。'
+                '\n・照片已經匯入 Lightroom 的話，寫入後要在 Lightroom 選取這些照片，'
+                '按「中繼資料 → 從檔案讀取中繼資料」才會更新。'
+                '\n・如果 Lightroom 開著「自動將變更寫入 XMP」，它可能會蓋掉本工具寫的內容。'
+                '\n\n要繼續嗎？')
+        if not messagebox.askyesno('確認', msg):
+            return
+        done, errors, log = apply_xmp(plan, f)
+        state['results'] = []
+        refresh_table()
+        created = sum(1 for _, a, _k in done if a == 'created')
+        kept = sum(1 for _, _a, k in done if k)
+        msg = '已寫入 %d 張（新建 %d 個 .xmp、合併 %d 個）。' % (len(done), created, len(done) - created)
+        if kept:
+            msg += '\n其中 %d 張原本就有星等或色標，已保留原本的。' % kept
+        if len(done) < len(plan) - len(errors):
+            msg += '\n%d 張內容沒有變化，不用重寫。' % (len(plan) - len(errors) - len(done))
+        if log:
+            msg += '\n紀錄檔：%s（可以按「↶ 復原上一次」還原）' % os.path.basename(log)
         if errors:
             msg += '\n\n%d 個失敗：\n' % len(errors) + '\n'.join('%s：%s' % (os.path.basename(a), b) for a, b in errors[:10])
         status.set(msg.split('\n')[0])
@@ -1840,7 +2339,9 @@ def run_gui(initial_folder=None):
         state['results'] = []
         refresh_table()
         status.set('已復原 %d 個檔案' % n)
-        messagebox.showinfo('完成', '已復原 %d 個檔案' % n + ('\n%d 個失敗' % len(errors) if errors else ''))
+        messagebox.showinfo('完成', '已復原 %d 個檔案' % n + (
+            '\n\n%d 個沒有復原：\n' % len(errors) + '\n'.join('%s：%s' % (os.path.basename(a), b) for a, b in errors[:10])
+            if errors else ''))
 
     def do_export():
         f = check_folder()
@@ -2018,7 +2519,8 @@ def run_cli(argv):
     ap.add_argument('folder')
     ap.add_argument('--preview', action='store_true', help='只預覽（預設行為）')
     ap.add_argument('--apply', action='store_true', help='實際執行（不加只預覽）')
-    ap.add_argument('--output', choices=['rename', 'folder'], default='rename', help='改檔名或分資料夾')
+    ap.add_argument('--output', choices=['rename', 'folder', 'xmp'], default='rename',
+                    help='改檔名、分資料夾，或寫入 Lightroom 標籤（RAW 旁邊的 .xmp）')
     ap.add_argument('--mode', choices=['both', 'skin', 'main'], default='both')
     ap.add_argument('--order', choices=['skin', 'main'], default='skin')
     ap.add_argument('--no-digits', action='store_true', help='不加排序數字')
@@ -2088,6 +2590,23 @@ def run_cli(argv):
     if a.csv:
         export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
         print('已匯出 CSV：%s' % a.csv)
+    if a.output == 'xmp':
+        plan, skipped = plan_xmp(rows)
+        by_source = {r['source']: r for r in rows if not r.get('error')}
+        for p in plan:
+            print('  %s -> %s：%s' % (p['source'], os.path.basename(p['xmp']), xmp_summary(by_source[p['source']])))
+        if skipped:
+            print('不寫入 %d 張：%s' % (len(skipped), XMP_SKIP_REASON))
+        if a.apply:
+            done, errors, log = apply_xmp(plan, a.folder)
+            kept = sum(1 for _, _a, k in done if k)
+            print('已寫入 %d 張（%d 張保留原本的星等或色標），失敗 %d 個%s' % (
+                len(done), kept, len(errors), '，紀錄：%s' % log if log else ''))
+            for path, err in errors[:20]:
+                print('  [失敗] %s：%s' % (os.path.basename(path), err))
+        else:
+            print('（預覽模式，加上 --apply 才會寫入）')
+        return
     plan = plan_renames(rows, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
     for old, new in plan:
         print('  %s -> %s' % (os.path.basename(old), os.path.relpath(new, os.path.dirname(old))))
