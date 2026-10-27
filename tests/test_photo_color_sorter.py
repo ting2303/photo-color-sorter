@@ -281,10 +281,12 @@ class PickingTests(unittest.TestCase):
         pcs.export_csv(rows, out)
         with open(out, encoding='utf-8-sig') as fp:
             data = list(csv.reader(fp))
-        self.assertEqual(data[0][0], '檔名')
-        self.assertEqual(data[1][0], 'IMG_1.jpg')
-        self.assertEqual(data[1][3], 'S01')
-        self.assertTrue(data[1][14].startswith('無6藍_'))
+        col = {name: i for i, name in enumerate(data[0])}
+        self.assertEqual(data[1][col['檔名']], 'IMG_1.jpg')
+        self.assertEqual(data[1][col['燈光段落']], 'S01')
+        self.assertEqual(data[1][col['星等']], '1')  # 沒有臉
+        self.assertTrue(data[1][col['結果']].startswith('無6藍_'))
+        self.assertEqual(len(data[1]), len(data[0]))
 
 
 class StabilityTests(unittest.TestCase):
@@ -443,3 +445,96 @@ class TimeSeqAndRestoreTests(unittest.TestCase):
         plan, by_log = pcs.plan_restore(out, [orig])
         self.assertEqual(sorted(os.path.basename(b) for _, b in plan), ['DSC_1-edit.jpg', 'DSC_10-edit.jpg'])
         self.assertEqual(by_log, 2)
+
+
+class SixFeatureTests(unittest.TestCase):
+    """人物分組、亮度分組、自動評分、調色起點、分析報告"""
+
+    def rows(self, spec):
+        """spec: [dict(覆蓋欄位)] -> 假的分析結果（已依時間排序）"""
+        import datetime
+        t0 = datetime.datetime(2026, 6, 20, 19, 0, 0)
+        out = []
+        for i, s in enumerate(spec):
+            r = dict(dir='.', stem='P%03d' % i, source='P%03d.jpg' % i, files=['P%03d.jpg' % i],
+                     skin=pcs.WHITE, skin_ratio=0.8, faces=1, main=5, main_ratio=0.6, top=[(5, 0.6)],
+                     highlight=0.0, main_perf=5, main_perf_ratio=0.6, top_perf=[(5, 0.6)],
+                     sharp=1.0 + i * 0.01, face_px=100.0, face_bright=0.6, face_emb=None, face_ab=(10.0, 15.0),
+                     time=t0 + datetime.timedelta(seconds=5 * i), time_src='EXIF', error=None)
+            r.update(s)
+            out.append(r)
+        return out
+
+    @staticmethod
+    def emb(seed):
+        rng = np.random.default_rng(seed)
+        v = rng.normal(size=128)
+        return (v / np.linalg.norm(v)).tolist()
+
+    def test_person_groups(self):
+        a, b = self.emb(1), self.emb(2)
+        near = lambda v, k: (np.array(v) + 0.05 * np.array(self.emb(100 + k))).tolist()
+        spec = [dict(face_emb=near(a, i)) for i in range(5)] + [dict(face_emb=near(b, i)) for i in range(3)]
+        spec += [dict(face_emb=None, faces=0)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual([r['person'] for r in rows], ['P1'] * 5 + ['P2'] * 3 + [None])
+
+    def test_brightness_groups_per_person(self):
+        # 同一人：最亮 0.8；0.8 → 亮，0.55（約 -1.2 級）→ 中，0.3（約 -3 級）→ 暗
+        a = self.emb(1)
+        spec = [dict(face_emb=a, face_bright=v) for v in (0.8, 0.8, 0.8, 0.55, 0.3)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual([r['bright'] for r in rows], ['亮', '亮', '亮', '中', '暗'])
+
+    def test_stars(self):
+        spec = [dict(sharp=0.1), dict(faces=0, face_px=0.0, face_bright=None, face_ab=None)]
+        spec += [dict(sharp=5.0 + i, face_px=200.0) for i in range(6)]  # 清楚、臉大
+        spec += [dict(sharp=2.0, face_px=50.0)]
+        rows = pcs.batch_features(self.rows(spec))
+        by = {r['source']: r for r in rows}
+        self.assertEqual(by['P000.jpg']['stars'], 1)  # 最模糊
+        self.assertEqual((by['P001.jpg']['stars'], by['P001.jpg']['star_why']), (1, '沒有臉'))
+        self.assertEqual(by['P007.jpg']['stars'], 3)
+        self.assertEqual(by['P008.jpg']['stars'], 2)
+        self.assertIn('臉偏小', by['P008.jpg']['star_why'])
+
+    def test_wb_direction(self):
+        """自然光的臉 (10, 15)；被藍光打到 b 降 20 → 建議往暖（色溫為正）；洋紅光 a 升 12 → 色調往綠（負）"""
+        spec = [dict(), dict(), dict(skin=5, face_ab=(10.0, -5.0)), dict(skin=8, face_ab=(22.0, 15.0)),
+                dict(skin=pcs.WHITE, face_ab=(11.0, 16.0))]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual(pcs.wb_text(rows[2]), '色溫+20 色調+0')
+        self.assertEqual(pcs.wb_text(rows[3]), '色溫+0 色調-12')
+        self.assertEqual(pcs.wb_text(rows[4]), '—')  # 差很小
+
+    def test_report_normal_and_warnings(self):
+        lines, notes = pcs.build_report(pcs.batch_features(self.rows([dict(main=5)] * 12)))
+        self.assertTrue(any(x.startswith('照片：12 張') for x in lines))
+        self.assertEqual(notes, ['✓ 沒有發現異常'])
+        spec = [dict(main=pcs.WHITE, time_src='檔案時間', faces=0, face_px=0.0, face_bright=None, face_ab=None)] * 12
+        bad = [dict(dir='.', stem='x', source='x.jpg', files=['x.jpg'], error='無法讀取圖片')]
+        lines, notes = pcs.build_report(pcs.batch_features(self.rows(spec) + bad))
+        text = '\n'.join(notes)
+        self.assertIn('1 張讀取失敗', text)
+        self.assertIn('整體判成白', text)
+        self.assertIn('沒偵測到臉', text)
+        self.assertIn('沒有讀到任何拍攝時間', text)
+        lines, notes = pcs.build_report([])
+        self.assertTrue(notes[0].startswith('⚠ 沒有任何照片'))
+
+    def test_sface_model(self):
+        self.assertTrue(pcs.sface_available())
+        old, pcs._sface = pcs.SFACE_MODEL, None
+        try:
+            pcs.SFACE_MODEL = os.path.join(tempfile.gettempdir(), 'no_such_model.onnx')
+            self.assertFalse(pcs.sface_available())  # 沒有模型時只是略過，不會出錯
+            self.assertIsNone(pcs.face_embedding(solid((0, 0, 0)), []))
+        finally:
+            pcs.SFACE_MODEL, pcs._sface = old, None
+
+    def test_brightness_compares_within_person(self):
+        """A 一直站在暗處、B 一直在亮處：各自和自己比，A 不會全被判成暗"""
+        a, b = self.emb(1), self.emb(2)
+        spec = [dict(face_emb=a, face_bright=0.3) for _ in range(4)] + [dict(face_emb=b, face_bright=0.85) for _ in range(4)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual([r['bright'] for r in rows], ['亮'] * 8)
