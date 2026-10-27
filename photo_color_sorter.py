@@ -35,6 +35,7 @@ import csv
 import sys
 import queue
 import argparse
+import json
 import struct
 import hashlib
 import datetime
@@ -45,7 +46,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.3.0'
+__version__ = '1.4.0'
 
 try:
     import rawpy
@@ -78,6 +79,10 @@ CATEGORIES = [
     ('', '無'),
 ]
 WHITE, DARK, NOFACE = 8, 9, 10
+
+# 顏色小方塊與圖例用的鮮明色（表格底色用下面較淡的 TAG_COLORS）
+SWATCH_COLORS = ['#e5484d', '#f08c24', '#e9c71a', '#3aa655', '#25b5c4', '#3a6fe0',
+                 '#8a4fd6', '#ec6fb8', '#f2f2f2', '#555555', '#ffffff']
 
 # 預覽表格的底色
 TAG_COLORS = ['#ffb3b3', '#ffd6a6', '#fff3a6', '#bff0bf', '#b3f0f0', '#b3c8ff',
@@ -112,6 +117,33 @@ STAGE_PRESETS = {
                  SKIN_NATURAL_HUE=(8, 35), SKIN_NEUTRAL_S=0.08),
 }
 STAGE_NAMES = {'standard': '標準', 'pale': '淡色舞台'}
+
+
+# 挑圖功能開關（進階設定）。關掉的功能不顯示；人物分組關掉時連臉部特徵都不計算，分析較快
+FEATURES = ('rep', 'stars', 'person', 'bright', 'wb', 'timeline')
+FEATURE_NAMES = {'rep': '代表張', 'stars': '星等', 'person': '人物分組', 'bright': '亮度分組',
+                 'wb': '調色起點', 'timeline': '燈光時間軸'}
+ALL_FEATURES = {k: True for k in FEATURES}
+SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.photo_color_sorter.json')
+
+
+def load_settings(path=None):
+    """讀取上次的進階設定；檔案不存在或壞掉時回傳空設定"""
+    try:
+        with open(path or SETTINGS_PATH, encoding='utf-8') as fp:
+            data = json.load(fp)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(data, path=None):
+    try:
+        with open(path or SETTINGS_PATH, 'w', encoding='utf-8') as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=1)
+        return True
+    except Exception:
+        return False
 
 
 def apply_stage_preset(name='standard'):
@@ -593,7 +625,7 @@ def photo_metrics(work, faces):
     return float(sharp), face_px, face_bright
 
 
-def analyze_group(group, stage='standard'):
+def analyze_group(group, stage='standard', person=True):
     apply_stage_preset(stage)
     path = os.path.join(group['dir'], group['source'])
     try:
@@ -610,7 +642,7 @@ def analyze_group(group, stage='standard'):
         else:
             main_p, main_p_ratio, top_p = main, main_ratio, top
         sharp, face_px, face_bright = photo_metrics(work, faces)
-        emb = face_embedding(work, faces)
+        emb = face_embedding(work, faces) if person else None
         ab = face_lab(work, faces)
         t, t_src = group_capture_time(group)
         return dict(group, skin=skin, skin_ratio=skin_ratio, faces=nfaces,
@@ -877,13 +909,14 @@ def wb_text(r):
     return '色溫%+d 色調%+d' % (round(r['wb_temp']), round(r['wb_tint']))
 
 
-def build_report(rows, mode='both', order='skin', performer=False):
+def build_report(rows, mode='both', order='skin', performer=False, features=None):
     """分析報告：整批結果的統計，以及需要注意的地方。回傳 (摘要行清單, 提醒清單)。
     提醒依「⚠ 需要注意」與「ℹ 參考」分級，讓使用者知道這次的結果可不可靠、該怎麼調。"""
     ok = [r for r in rows if not r.get('error')]
     bad = [r for r in rows if r.get('error')]
     n = len(ok)
     lines, notes = [], []
+    on = dict(ALL_FEATURES, **(features or {}))
     pct = lambda k: 100.0 * k / n if n else 0.0
     lines.append('照片：%d 張成功分析%s' % (n, '，%d 張讀取失敗' % len(bad) if bad else ''))
     if not n:
@@ -902,22 +935,32 @@ def build_report(rows, mode='both', order='skin', performer=False):
     lines.append('燈光段落：%d 段，每段平均 %.1f 張' % (scenes, n / max(scenes, 1)))
     persons = {r['person'] for r in ok if r.get('person')}
     with_face = [r for r in ok if r['faces']]
-    if not sface_available():
+    person_on = on['person'] and sface_available()
+    if not on['person']:
+        pass
+    elif not sface_available():
         lines.append('人物分組：沒有人臉辨識模型，已略過')
     else:
         lines.append('人物分組：%d 組（%d 張有臉）' % (len(persons), len(with_face)))
     stars = {s: sum(r['stars'] == s for r in ok) for s in (3, 2, 1)}
-    lines.append('自動評分：3 星 %d、2 星 %d、1 星 %d' % (stars[3], stars[2], stars[1]))
+    if on['stars']:
+        lines.append('自動評分：3 星 %d、2 星 %d、1 星 %d' % (stars[3], stars[2], stars[1]))
     br = {b: sum(r.get('bright') == b for r in ok) for b in ('亮', '中', '暗')}
-    lines.append('亮度分組：亮 %d、中 %d、暗 %d' % (br['亮'], br['中'], br['暗']))
+    if on['bright']:
+        lines.append('亮度分組：亮 %d、中 %d、暗 %d' % (br['亮'], br['中'], br['暗']))
     shifted = [r for r in ok if r.get('wb_shift') is not None and r['wb_shift'] >= WB_MIN_SHIFT]
     has_ref = any(r.get('wb_shift') is not None for r in ok)
-    if not with_face:
+    if not on['wb']:
+        pass
+    elif not with_face:
         lines.append('調色起點：沒有偵測到臉，無法建議')
     elif not has_ref:
         lines.append('調色起點：沒有在自然光下的臉可當基準，無法建議（每張臉都被色光照到，或是黑白照片）')
     else:
         lines.append('調色起點：%d 張的臉有明顯色偏，建議先調白平衡' % len(shifted))
+    off = [FEATURE_NAMES[k] for k in FEATURES if not on[k]]
+    if off:
+        lines.append('已關閉：' + '、'.join(off))
 
     white = sum(r['main'] == WHITE for r in ok)
     unc = sum(r['uncertain'] for r in ok)
@@ -949,7 +992,7 @@ def build_report(rows, mode='both', order='skin', performer=False):
         notes.append('ℹ 沒有讀到任何拍攝時間（可能是截圖、轉存或社群下載的照片），段落與時間序號改用檔案時間，順序可能不準')
     elif exif < n:
         notes.append('ℹ %d 張沒有拍攝時間，改用檔案時間（表格時間後面有 *）' % (n - exif))
-    if sface_available() and len(with_face) >= 10:
+    if person_on and len(with_face) >= 10:
         size = {}
         for r in ok:
             if r.get('person'):
@@ -959,7 +1002,7 @@ def build_report(rows, mode='both', order='skin', performer=False):
             notes.append('ℹ 人物分組有 %d 組只有 1～2 張，可能是同一人被拆開（濃妝、側臉、臉太小或模糊），可以用「表格排序：人物」人工確認'
                          % len(small))
     blur1 = sum(r['stars'] == 1 and r.get('star_why') == '可能模糊' for r in ok)
-    if n >= 10 and blur1 >= 0.3 * n:
+    if on['stars'] and n >= 10 and blur1 >= 0.3 * n:
         notes.append('ℹ %d 張被評為可能模糊（%.0f%%）：如果現場本來就很暗或有大量動態，可以改看清晰度數字挑選' % (blur1, pct(blur1)))
     if scenes >= 0.6 * n and n >= 10:
         notes.append('ℹ 段落很碎（%d 張分成 %d 段）：燈光變化很快，或拍攝時間不連續' % (n, scenes))
@@ -968,8 +1011,8 @@ def build_report(rows, mode='both', order='skin', performer=False):
     return lines, notes
 
 
-def report_text(rows, mode='both', order='skin', folder=None, performer=False):
-    lines, notes = build_report(rows, mode, order, performer)
+def report_text(rows, mode='both', order='skin', folder=None, performer=False, features=None):
+    lines, notes = build_report(rows, mode, order, performer, features)
     head = ['舞台照片色彩分類工具 v%s 分析報告' % __version__,
             '時間：%s' % datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]
     if folder:
@@ -977,8 +1020,9 @@ def report_text(rows, mode='both', order='skin', folder=None, performer=False):
     return '\n'.join(head + [''] + lines + ['', '需要注意：'] + notes) + '\n'
 
 
-def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False):
-    """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟"""
+def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False, features=None):
+    """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟；關掉的挑圖功能欄位留空"""
+    on = dict(ALL_FEATURES, **(features or {}))
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
         wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '人物', '亮度',
@@ -992,8 +1036,10 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
             new = (os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
                    else build_prefix(r, mode, order, digits, time_seq) + clean)
             wr.writerow([r['source'], r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
-                         'S%02d' % r['scene'], '★' if r['rep'] else '', r['sharp_score'], r.get('stars', ''),
-                         r.get('star_why', ''), r.get('person') or '', r.get('bright') or '', wb_text(r), r['faces'],
+                         'S%02d' % r['scene'], '★' if r['rep'] and on['rep'] else '', r['sharp_score'],
+                         r.get('stars', '') if on['stars'] else '', r.get('star_why', '') if on['stars'] else '',
+                         (r.get('person') or '') if on['person'] else '', (r.get('bright') or '') if on['bright'] else '',
+                         wb_text(r) if on['wb'] else '', r['faces'],
                          label(r['skin']), '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                          label(r['main']), '%d%%' % (r['main_ratio'] * 100),
                          ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top']),
@@ -1198,11 +1244,11 @@ def plan_restore(folder, log_folders=(), recursive=False):
     return plan, by_log
 
 
-def run_analysis(groups, progress=None, workers=None, stage='standard'):
+def run_analysis(groups, progress=None, workers=None, stage='standard', person=True):
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     results = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(analyze_group, g, stage) for g in groups]
+        futs = [ex.submit(analyze_group, g, stage, person) for g in groups]
         for i, f in enumerate(as_completed(futs), 1):
             results.append(f.result())
             if progress:
@@ -1240,16 +1286,51 @@ def run_gui(initial_folder=None):
     splits_text = tk.StringVar(value='')
     show_all = tk.BooleanVar(value=False)
     adv_open = tk.BooleanVar(value=False)
+    group_scene = tk.BooleanVar(value=True)
+    feat = {k: tk.BooleanVar(value=True) for k in FEATURES}
     status = tk.StringVar(value='請選擇照片資料夾，再按「① 分析」')
-    state = {'results': [], 'busy': False}
+    state = {'results': [], 'busy': False, 'person_done': True, 'swatch': {}, 'tl': None}
     q = queue.Queue()
 
+    # 記住上次的設定（存在使用者資料夾的 .photo_color_sorter.json）
+    saved = load_settings()
+    for var, k in ((output, 'output'), (mode, 'mode'), (order, 'order'), (sort_by, 'sort_by'),
+                   (stage, 'stage'), (scene_mode, 'scene_mode')):
+        if isinstance(saved.get(k), str):
+            var.set(saved[k])
+    for var, k in ((digits, 'digits'), (performer, 'performer'), (time_seq, 'time_seq'), (show_all, 'show_all'),
+                   (adv_open, 'adv_open'), (group_scene, 'group_scene')):
+        if isinstance(saved.get(k), bool):
+            var.set(saved[k])
+    for k, v in (saved.get('features') or {}).items():
+        if k in feat and isinstance(v, bool):
+            feat[k].set(v)
+    if stage.get() not in STAGE_PRESETS:
+        stage.set('standard')
+
+    def features_now():
+        return {k: v.get() for k, v in feat.items()}
+
+    def remember():
+        save_settings({'output': output.get(), 'mode': mode.get(), 'order': order.get(), 'sort_by': sort_by.get(),
+                       'stage': stage.get(), 'scene_mode': scene_mode.get(), 'digits': digits.get(),
+                       'performer': performer.get(), 'time_seq': time_seq.get(), 'show_all': show_all.get(),
+                       'adv_open': adv_open.get(), 'group_scene': group_scene.get(), 'features': features_now()})
+
     def on_option():
+        apply_columns()
         refresh_table()
+        remember()
         is_folder = output.get() == 'folder'
         b_apply.configure(text='② 執行分資料夾' if is_folder else '② 執行改名')
         m_tools.entryconfig(STRIP_LABEL, state='disabled' if is_folder or state['busy'] else 'normal')
         c_seq.state(['disabled'] if is_folder else ['!disabled'])
+
+    def on_feature(k):
+        if (k == 'person' and feat['person'].get() and state['results'] and not state['person_done']
+                and not state['busy'] and messagebox.askyesno('重新分析', '打開「人物分組」需要重新分析才會有結果，要現在開始嗎？')):
+            start_analysis()
+        on_option()
 
     def on_stage():
         if state['results'] and not state['busy'] and messagebox.askyesno(
@@ -1325,6 +1406,8 @@ def run_gui(initial_folder=None):
     ttk.Label(a2, text='　表格排序：').pack(side='left')
     for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人物', 'person'), ('星等', 'stars')):
         ttk.Radiobutton(a2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
+    ttk.Checkbutton(a2, text='依段落分組（照拍攝時間排序時）', variable=group_scene,
+                    command=on_option).pack(side='left', padx=10)
     a3 = ttk.Frame(adv)
     a3.pack(fill='x', pady=(4, 0))
     ttk.Label(a3, text='燈光段落：').pack(side='left')
@@ -1336,11 +1419,23 @@ def run_gui(initial_folder=None):
     e_split.bind('<Return>', lambda e: on_scene())
     ttk.Button(a3, text='套用', command=on_scene).pack(side='left', padx=4)
     ttk.Label(a3, text='例：2921, 3040, 3074', foreground='#777').pack(side='left', padx=6)
+    a4 = ttk.Frame(adv)
+    a4.pack(fill='x', pady=(4, 0))
+    ttk.Label(a4, text='挑圖功能：').pack(side='left')
+    for k in FEATURES:
+        ttk.Checkbutton(a4, text=FEATURE_NAMES[k], variable=feat[k],
+                        command=lambda k=k: on_feature(k)).pack(side='left', padx=(0, 8))
+    ttk.Label(a4, text='（不需要的可以關掉；關掉人物分組分析會快很多）', foreground='#777').pack(side='left')
 
-    legend = ttk.Label(root, padding=(8, 4), foreground='#555',
-                       text='顏色：0白 1紅 2橙 3黃 4綠 5青 6藍 7紫 8粉 9暗　｜　代表 ★：每段先修這張，再同步給整段　｜　'
-                            '其他欄位說明在選單「說明」')
+    # 圖例：用色塊代替文字
+    legend = ttk.Frame(root, padding=(8, 4))
     legend.pack(fill='x')
+    ttk.Label(legend, text='顏色：', foreground='#555').pack(side='left')
+    for i in list(range(8)) + [WHITE, DARK]:
+        tk.Label(legend, text=' %s ' % tag(i), bg=SWATCH_COLORS[i], fg='#ffffff' if i in (5, 6, DARK) else '#111111',
+                 bd=0, padx=1).pack(side='left', padx=1)
+    ttk.Label(legend, foreground='#555',
+              text='　左邊小方塊：左半＝膚色、右半＝整體　｜　★ 代表張：每段先修這張　｜　其他說明在選單「說明」').pack(side='left')
 
     def toggle_adv(flip=False):
         if flip:
@@ -1358,6 +1453,8 @@ def run_gui(initial_folder=None):
                             '改檔名例：6藍7紫_原檔名 → 前面是優先項目，後面是另一項\n\n'
                             '段落：照拍攝時間切開的同燈光區段；進階設定可以手動輸入檔名號碼分段\n'
                             '代表 ★：每段最適合先修的一張\n'
+                            '每列左邊的小方塊：左半是膚色、右半是整體主色\n'
+                            '燈光時間軸（表格上方）：點一下就跳到那一段\n'
                             '星等：整批相對初篩（1 星 = 沒有臉、太暗或可能模糊）\n'
                             '人物：同一人歸同一組（P1 照片最多），只比對臉像不像，不辨識是誰\n\n'
                             '「顯示 → 顯示所有欄位」還有：\n'
@@ -1372,8 +1469,8 @@ def run_gui(initial_folder=None):
     btns.pack(fill='x')
     b_analyze = ttk.Button(btns, text='① 分析（預覽，不動檔案）', command=lambda: start_analysis())
     b_apply = ttk.Button(btns, text='② 執行改名', command=lambda: do_apply())
-    b_undo = ttk.Button(btns, text='復原上一次', command=lambda: do_undo())
-    b_report = ttk.Button(btns, text='分析報告', command=lambda: do_report())
+    b_undo = ttk.Button(btns, text='↶ 復原上一次', command=lambda: do_undo())
+    b_report = ttk.Button(btns, text='▤ 分析報告', command=lambda: do_report())
     for b in (b_analyze, b_apply, b_undo, b_report):
         b.pack(side='left', padx=4)
     pbar = ttk.Progressbar(btns, length=250)
@@ -1386,12 +1483,23 @@ def run_gui(initial_folder=None):
              '整體', '整體比例', '整體組成', '燈光爆點', '結果')
     widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 40, 45, 65, 50, 65, 160, 65, 300)
     basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'skin', 'main', 'new')
+    feat_cols = {'rep': 'rep', 'stars': 'stars', 'person': 'person', 'bright': 'bright', 'wb': 'wb'}
+
+    # 燈光時間軸色帶：整場的整體主色與膚色，點一下跳到那一段
+    tl_frame = ttk.Frame(root, padding=(8, 0, 8, 4))
+    tl = tk.Canvas(tl_frame, height=62, background='white', highlightthickness=1, highlightbackground='#c8c8c8',
+                   cursor='hand2')
+    tl.pack(fill='x')
+
     frame = ttk.Frame(root)
     frame.pack(fill='both', expand=True, padx=8)
-    tree = ttk.Treeview(frame, columns=cols, show='headings', displaycolumns=basic_cols)
+    tree = ttk.Treeview(frame, columns=cols, show='tree headings', displaycolumns=basic_cols)
+    tree.heading('#0', text='')
+    tree.column('#0', width=70, stretch=False, anchor='w')
     for c, hd, w in zip(cols, heads, widths):
         tree.heading(c, text=hd)
         tree.column(c, width=w, anchor='w')
+    tree.tag_configure('scenehdr', background='#e6ebf2', font=('Microsoft JhengHei UI', 10, 'bold'))
     sb = ttk.Scrollbar(frame, orient='vertical', command=tree.yview)
     sbx = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
     tree.configure(yscrollcommand=sb.set, xscrollcommand=sbx.set)
@@ -1405,7 +1513,77 @@ def run_gui(initial_folder=None):
     tree.tag_configure('err', background='#ffdddd', foreground='#a00')
 
     def apply_columns():
-        tree.configure(displaycolumns='#all' if show_all.get() else basic_cols)
+        base = cols if show_all.get() else basic_cols
+        hide = {feat_cols[k] for k in feat_cols if not feat[k].get()}
+        if group_scene.get() and sort_by.get() == 'time':
+            hide.add('scene')  # 已經依段落分組，不必再顯示段落欄
+        tree.configure(displaycolumns=[c for c in base if c not in hide])
+
+    def swatch(skin, main):
+        """每列左邊的小方塊：左半膚色、右半整體主色"""
+        key = (skin, main)
+        if key not in state['swatch']:
+            img = tk.PhotoImage(width=28, height=14)
+            img.put('#888888', to=(0, 0, 28, 14))
+            img.put(SWATCH_COLORS[skin], to=(1, 1, 14, 13))
+            img.put(SWATCH_COLORS[main], to=(14, 1, 27, 13))
+            state['swatch'][key] = img
+        return state['swatch'][key]
+
+    def draw_timeline(rows=None):
+        tl.delete('all')
+        if rows is not None:
+            state['tl'] = sorted([r for r in rows if not r.get('error')], key=lambda r: (r['time'], r['dir'], r['stem']))
+        rs = state['tl'] or []
+        if not rs or not feat['timeline'].get():
+            tl_frame.pack_forget()
+            return
+        if not tl_frame.winfo_ismapped():
+            tl_frame.pack(fill='x', before=frame)
+        W = max(tl.winfo_width(), 400)
+        L, R = 44, 10
+        t0, t1 = rs[0]['time'], rs[-1]['time']
+        span = (t1 - t0).total_seconds()
+        if span < 1:
+            xs = [L + (W - L - R) * i / max(len(rs) - 1, 1) for i in range(len(rs))]
+        else:
+            xs = [L + (W - L - R) * (r['time'] - t0).total_seconds() / span for r in rs]
+        state['tl_x'] = xs
+        tl.create_text(4, 12, text='整體', anchor='w', font=('Microsoft JhengHei UI', 8), fill='#555')
+        tl.create_text(4, 30, text='膚色', anchor='w', font=('Microsoft JhengHei UI', 8), fill='#555')
+        last = -100
+        for i, r in enumerate(rs):
+            x0 = xs[i]
+            x1 = max(xs[i + 1] if i + 1 < len(rs) else x0 + 3, x0 + 2)
+            tl.create_rectangle(x0, 4, x1, 20, fill=SWATCH_COLORS[r['main']], outline='')
+            tl.create_rectangle(x0, 22, x1, 38, fill=SWATCH_COLORS[r['skin']], outline='')
+            if not i or r['scene'] != rs[i - 1]['scene']:
+                if i:
+                    tl.create_line(x0, 2, x0, 42, fill='#222', dash=(2, 2))
+                if x0 - last >= 26:
+                    tl.create_text(x0 + 2, 52, text='S%02d' % r['scene'], anchor='w',
+                                   font=('Segoe UI', 7), fill='#333')
+                    last = x0
+            if r.get('rep') and feat['rep'].get():
+                tl.create_text(x0, 46, text='★', fill='#b8860b', font=('Segoe UI', 8))
+
+    def on_timeline_click(event):
+        rs = state['tl'] or []
+        xs = state.get('tl_x') or []
+        if not rs or not xs:
+            return
+        i = min(range(len(xs)), key=lambda k: abs(xs[k] - event.x))
+        s = rs[i]['scene']
+        target = 'scene-%d' % s if tree.exists('scene-%d' % s) else None
+        if target is None:
+            target = next((iid for iid in tree.get_children() if tree.set(iid, 'file') == rs[i]['source']), None)
+        if target:
+            tree.selection_set(target)
+            tree.see(target)
+            status.set('段落 S%02d（%s 起）' % (s, rs[i]['time'].strftime('%H:%M:%S')))
+
+    tl.bind('<Button-1>', on_timeline_click)
+    tl.bind('<Configure>', lambda e: draw_timeline())
 
     ttk.Label(root, textvariable=status, padding=8).pack(fill='x')
 
@@ -1439,9 +1617,30 @@ def run_gui(initial_folder=None):
     def refresh_table():
         tree.delete(*tree.get_children())
         rows, sort_key = current_rows()
+        f = features_now()
+        grouped = group_scene.get() and sort_by.get() == 'time'
+        parents = {}
+        if grouped:  # 每段一個標題列：張數、時間、主色、代表張
+            by = {}
+            for r in rows:
+                if not r.get('error'):
+                    by.setdefault(r['scene'], []).append(r)
+            for s, members in by.items():
+                cnt = {}
+                for r in members:
+                    cnt[r['main']] = cnt.get(r['main'], 0) + 1
+                dom = max(cnt, key=cnt.get)
+                rep_name = next((r['source'] for r in members if r['rep']), '')
+                vals = {c: '' for c in cols}
+                vals['file'] = '%d 張　主色 %s' % (len(members), label(dom))
+                vals['time'] = members[0]['time'].strftime('%H:%M:%S')
+                vals['new'] = '到 %s 為止%s' % (members[-1]['time'].strftime('%H:%M:%S'),
+                                                ('　｜　★ 先修：' + rep_name) if rep_name and f['rep'] else '')
+                parents[s] = tree.insert('', 'end', iid='scene-%d' % s, text='S%02d' % s, open=True,
+                                         values=[vals[c] for c in cols], tags=('scenehdr',))
         for r in rows:
             if r.get('error'):
-                tree.insert('', 'end', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', ''),
+                tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', ''),
                             tags=('err',))
                 continue
             clean = strip_prefix(r['source'])
@@ -1454,12 +1653,16 @@ def run_gui(initial_folder=None):
                 new += '  (+%d 個同名檔)' % extra
             top3 = ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top'])
             t = r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*')
-            tree.insert('', 'end', tags=('c%d' % r[sort_key],), values=(
-                r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] else '', '★' * r['stars'], r['sharp_score'],
-                r.get('person') or '', r.get('bright') or '', wb_text(r), r['faces'], label(r['skin']),
+            tree.insert(parents.get(r['scene'], '') if grouped else '', 'end', tags=('c%d' % r[sort_key],),
+                        image=swatch(r['skin'], r['main']), values=(
+                r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] and f['rep'] else '',
+                '★' * r['stars'] if f['stars'] else '', r['sharp_score'],
+                (r.get('person') or '') if f['person'] else '', (r.get('bright') or '') if f['bright'] else '',
+                wb_text(r) if f['wb'] else '', r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                 label(r['main']) + ('?' if r['uncertain'] else ''), '%d%%' % (r['main_ratio'] * 100), top3,
                 '%d%%' % (r.get('highlight', 0) * 100), new))
+        draw_timeline(rows)
 
     def check_folder():
         f = folder.get().strip()
@@ -1481,9 +1684,13 @@ def run_gui(initial_folder=None):
         pbar['value'] = 0
         status.set('分析中… 共 %d 張%s' % (len(groups), '（淡色舞台設定）' if stage.get() == 'pale' else ''))
 
+        person_on = feat['person'].get()
+        state['person_done'] = person_on
+
         def worker():
             try:
-                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)), stage=stage.get())
+                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)), stage=stage.get(),
+                                   person=person_on)
                 q.put(('done', res))
             except Exception as e:
                 q.put(('fail', str(e)))
@@ -1500,7 +1707,7 @@ def run_gui(initial_folder=None):
                     state['results'] = msg[1]
                     refresh_table()
                     errs = sum(1 for r in msg[1] if r.get('error'))
-                    _, notes = build_report(current_rows()[0], mode.get(), order.get(), performer.get())
+                    _, notes = build_report(current_rows()[0], mode.get(), order.get(), performer.get(), features_now())
                     warn = [x for x in notes if x.startswith('⚠')]
                     status.set('分析完成：%d 張%s。%s' % (
                         len(msg[1]), '，%d 張讀取失敗' % errs if errs else '',
@@ -1577,7 +1784,7 @@ def run_gui(initial_folder=None):
             path = os.path.join(f, '_色彩分析_%s_%d.csv' % (stamp, k))
         try:
             rows, _ = current_rows()
-            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get(), time_seq.get())
+            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get(), time_seq.get(), features_now())
         except Exception as e:
             messagebox.showerror('無法匯出', str(e))
             return
@@ -1603,12 +1810,23 @@ def run_gui(initial_folder=None):
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
         rows, _ = current_rows()
-        text = report_text(rows, mode.get(), order.get(), folder.get().strip(), performer.get())
+        text = report_text(rows, mode.get(), order.get(), folder.get().strip(), performer.get(), features_now())
         win = tk.Toplevel(root)
         win.title('分析報告')
         win.geometry('720x520')
-        box = tk.Text(win, wrap='word', font=('Microsoft JhengHei UI', 11), padx=10, pady=10)
+        box = tk.Text(win, wrap='word', font=('Microsoft JhengHei UI', 11), padx=12, pady=10, spacing1=2, spacing3=2)
         box.insert('1.0', text)
+        # 提醒依輕重上色：⚠ 需要注意（橘）、ℹ 參考（藍）、✓ 正常（綠）
+        box.tag_configure('head', font=('Microsoft JhengHei UI', 13, 'bold'))
+        box.tag_configure('sec', font=('Microsoft JhengHei UI', 11, 'bold'))
+        box.tag_configure('warn', background='#fff1d6', foreground='#7a4b00', lmargin1=6, lmargin2=22)
+        box.tag_configure('info', background='#e7f0fc', foreground='#1d4a8a', lmargin1=6, lmargin2=22)
+        box.tag_configure('ok', background='#e3f5e9', foreground='#17663a', lmargin1=6)
+        for i, ln in enumerate(text.split('\n'), 1):
+            tag_name = ('head' if i == 1 else 'sec' if ln.startswith('需要注意') else 'warn' if ln.startswith('⚠')
+                        else 'info' if ln.startswith('ℹ') else 'ok' if ln.startswith('✓') else None)
+            if tag_name:
+                box.tag_add(tag_name, '%d.0' % i, '%d.end' % i)
         box.configure(state='disabled')
         box.pack(fill='both', expand=True)
         bar = ttk.Frame(win, padding=6)
@@ -1702,6 +1920,13 @@ def run_gui(initial_folder=None):
         if errors:
             msg += '\n\n%d 個失敗：\n' % len(errors) + '\n'.join('%s：%s' % (os.path.basename(a), b) for a, b in errors[:10])
         messagebox.showinfo('完成', msg)
+
+    def on_close():
+        remember()
+        root.destroy()
+    root.protocol('WM_DELETE_WINDOW', on_close)
+    toggle_adv()
+    on_option()
 
     poll()
     if initial_folder:
