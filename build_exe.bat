@@ -8,7 +8,6 @@ set PY=.venv\Scripts\python.exe
 %PY% -m unittest discover tests || exit /b 1
 %PY% -m PyInstaller --noconfirm --clean --windowed --name PhotoColorSorter ^
   --add-data "face_detection_yunet_2023mar.onnx;." ^
-  --add-data "face_recognition_sface_2021dec_int8.onnx;." ^
   photo_color_sorter.py || exit /b 1
 copy /y LICENSE dist\PhotoColorSorter\ >nul
 copy /y *.md dist\PhotoColorSorter\ >nul

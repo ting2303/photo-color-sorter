@@ -53,7 +53,7 @@ def read_labels(folder):
 def predict_by_analysis(folder, wanted, stage):
     """只分析有標註的照片（快很多）；回傳 {鍵: {'膚色', '整體', '人數', '檔名'}}"""
     groups = [g for g in pcs.collect_groups(folder) if key_of(g['source']) in wanted]
-    res = pcs.run_analysis(groups, stage=stage, person=False)
+    res = pcs.run_analysis(groups, stage=stage)
     out = {}
     for r in res:
         k = key_of(r['source'])

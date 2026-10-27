@@ -459,7 +459,7 @@ class FakeRows:
             r = dict(dir='.', stem='P%03d' % i, source='P%03d.jpg' % i, files=['P%03d.jpg' % i],
                      skin=pcs.WHITE, skin_ratio=0.8, faces=1, main=5, main_ratio=0.6, top=[(5, 0.6)],
                      highlight=0.0, main_perf=5, main_perf_ratio=0.6, top_perf=[(5, 0.6)],
-                     sharp=1.0 + i * 0.01, face_px=100.0, face_bright=0.6, face_emb=None, face_ab=(10.0, 15.0),
+                     sharp=1.0 + i * 0.01, face_px=100.0, face_bright=0.6, face_ab=(10.0, 15.0),
                      time=t0 + datetime.timedelta(seconds=5 * i), time_src='EXIF', error=None)
             r.update(s)
             out.append(r)
@@ -473,20 +473,22 @@ class FakeRows:
 
 
 class SixFeatureTests(FakeRows, unittest.TestCase):
-    """人物分組、亮度分組、自動評分、調色起點、分析報告"""
+    """亮度分組、自動評分、調色起點、分析報告"""
 
-    def test_person_groups(self):
-        a, b = self.emb(1), self.emb(2)
-        near = lambda v, k: (np.array(v) + 0.05 * np.array(self.emb(100 + k))).tolist()
-        spec = [dict(face_emb=near(a, i)) for i in range(5)] + [dict(face_emb=near(b, i)) for i in range(3)]
-        spec += [dict(face_emb=None, faces=0)]
-        rows = pcs.batch_features(self.rows(spec))
-        self.assertEqual([r['person'] for r in rows], ['P1'] * 5 + ['P2'] * 3 + [None])
+    def test_no_person_recognition(self):
+        """v1.5 起只偵測有沒有人、有幾個人，不辨認是不是同一個人：沒有辨識模型、沒有人物欄位與關鍵字"""
+        for name in ('SFACE_MODEL', '_get_sface', 'face_embedding', '_assign_persons', 'SAME_PERSON_COS'):
+            self.assertFalse(hasattr(pcs, name), name)
+        self.assertNotIn('person', pcs.FEATURES)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertFalse([f for f in os.listdir(root) if 'recognition' in f.lower()])
+        rows = pcs.batch_features(self.rows([dict(faces=2), dict(faces=1)]))
+        self.assertFalse([r for r in rows if 'person' in r or 'face_emb' in r])
+        self.assertFalse([k for k in pcs.xmp_fields(rows[0])['keywords'] if '人物' in k])
 
-    def test_brightness_groups_per_person(self):
-        # 同一人：最亮 0.8；0.8 → 亮，0.55（約 -1.2 級）→ 中，0.3（約 -3 級）→ 暗
-        a = self.emb(1)
-        spec = [dict(face_emb=a, face_bright=v) for v in (0.8, 0.8, 0.8, 0.55, 0.3)]
+    def test_brightness_groups(self):
+        # 整批最亮 0.8；0.8 → 亮，0.55（約 -1.2 級）→ 中，0.3（約 -3 級）→ 暗
+        spec = [dict(face_bright=v) for v in (0.8, 0.8, 0.8, 0.55, 0.3)]
         rows = pcs.batch_features(self.rows(spec))
         self.assertEqual([r['bright'] for r in rows], ['亮', '亮', '亮', '中', '暗'])
 
@@ -526,22 +528,11 @@ class SixFeatureTests(FakeRows, unittest.TestCase):
         lines, notes = pcs.build_report([])
         self.assertTrue(notes[0].startswith('⚠ 沒有任何照片'))
 
-    def test_sface_model(self):
-        self.assertTrue(pcs.sface_available())
-        old, pcs._sface = pcs.SFACE_MODEL, None
-        try:
-            pcs.SFACE_MODEL = os.path.join(tempfile.gettempdir(), 'no_such_model.onnx')
-            self.assertFalse(pcs.sface_available())  # 沒有模型時只是略過，不會出錯
-            self.assertIsNone(pcs.face_embedding(solid((0, 0, 0)), []))
-        finally:
-            pcs.SFACE_MODEL, pcs._sface = old, None
-
-    def test_brightness_compares_within_person(self):
-        """A 一直站在暗處、B 一直在亮處：各自和自己比，A 不會全被判成暗"""
-        a, b = self.emb(1), self.emb(2)
-        spec = [dict(face_emb=a, face_bright=0.3) for _ in range(4)] + [dict(face_emb=b, face_bright=0.85) for _ in range(4)]
+    def test_brightness_compares_with_whole_batch(self):
+        """不分人：一半站在暗處（0.3）、一半在亮處（0.85），暗處的和整批最亮的比 → 暗"""
+        spec = [dict(face_bright=0.3) for _ in range(4)] + [dict(face_bright=0.85) for _ in range(4)]
         rows = pcs.batch_features(self.rows(spec))
-        self.assertEqual([r['bright'] for r in rows], ['亮'] * 8)
+        self.assertEqual([r['bright'] for r in rows], ['暗'] * 4 + ['亮'] * 4)
 
 
 class ReportFixTests(FakeRows, unittest.TestCase):
@@ -585,12 +576,6 @@ class ReportFixTests(FakeRows, unittest.TestCase):
         text = '\n'.join(notes)
         self.assertIn('沒偵測到臉', text)
         self.assertNotIn('可能模糊', text)
-
-    def test_report_split_person_note(self):
-        a = self.emb(1)
-        spec = [dict(face_emb=a) for _ in range(8)] + [dict(face_emb=self.emb(10 + i)) for i in range(3)]
-        _, notes = pcs.build_report(pcs.batch_features(self.rows(spec)))
-        self.assertIn('只有 1～2 張', '\n'.join(notes))
 
     def test_same_name_different_formats_are_separate(self):
         d = tempfile.mkdtemp()
@@ -699,30 +684,32 @@ class FeatureToggleTests(FakeRows, unittest.TestCase):
         try:
             path = os.path.join(d, 's.json')
             self.assertEqual(pcs.load_settings(path), {})  # 沒有檔案
-            self.assertTrue(pcs.save_settings({'mode': 'skin', 'features': {'person': False}}, path))
-            self.assertEqual(pcs.load_settings(path)['features'], {'person': False})
+            self.assertTrue(pcs.save_settings({'mode': 'skin', 'features': {'bright': False}}, path))
+            self.assertEqual(pcs.load_settings(path)['features'], {'bright': False})
             with open(path, 'w') as fp:
                 fp.write('{broken')
             self.assertEqual(pcs.load_settings(path), {})  # 壞掉的檔案不會讓程式出錯
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
-    def test_person_off_skips_embedding(self):
+    def test_analysis_has_no_face_features(self):
+        """分析結果只有人數，沒有任何可以拿來比對身分的臉部特徵"""
         d = tempfile.mkdtemp()
         try:
             save(os.path.join(d, 'a.jpg'), solid((255, 0, 0)))
-            g = pcs.collect_groups(d)[0]
-            self.assertIsNone(pcs.analyze_group(g, person=False)['face_emb'])
+            r = pcs.analyze_group(pcs.collect_groups(d)[0])
+            self.assertIn('faces', r)
+            self.assertNotIn('face_emb', r)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
     def test_report_and_csv_respect_features(self):
         rows = pcs.batch_features(self.rows([dict() for _ in range(12)]))
-        off = {'stars': False, 'person': False, 'wb': False}
+        off = {'stars': False, 'bright': False, 'wb': False}
         lines, _ = pcs.build_report(rows, features=off)
         text = '\n'.join(lines)
-        self.assertFalse([x for x in lines if x.startswith(('自動評分', '人物分組', '調色起點'))])
-        self.assertIn('已關閉：星等、人物分組、調色起點', text)
+        self.assertFalse([x for x in lines if x.startswith(('自動評分', '亮度分組', '調色起點'))])
+        self.assertIn('已關閉：星等、亮度分組、調色起點', text)
         d = tempfile.mkdtemp()
         try:
             out = os.path.join(d, 'o.csv')
@@ -730,8 +717,9 @@ class FeatureToggleTests(FakeRows, unittest.TestCase):
             with open(out, encoding='utf-8-sig') as fp:
                 data = list(csv.reader(fp))
             col = {n: i for i, n in enumerate(data[0])}
-            self.assertEqual({data[1][col[k]] for k in ('星等', '評分說明', '人物', '調色起點建議')}, {''})
-            self.assertNotEqual(data[1][col['亮度']], '')  # 沒關的照常輸出
+            self.assertEqual({data[1][col[k]] for k in ('星等', '評分說明', '亮度', '調色起點建議')}, {''})
+            self.assertIn('★', [row[col['代表張']] for row in data[1:]])  # 沒關的照常輸出
+            self.assertNotIn('人物', data[0])
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -920,7 +908,8 @@ class XmpTests(FakeRows, unittest.TestCase):
         self.assertEqual((len(done), errors), (1, []))
         x = pcs.read_xmp(self.read('A.xmp'))
         self.assertEqual(x['rating'], str(rows[0]['stars']))
-        self.assertEqual(x['label'], 'Red')  # 只有一張，一定是代表張
+        self.assertEqual(x['label'], 'Purple')  # 預設依人：臉是粉 → 紫標
+        self.assertIn('舞台色彩|代表張', x['hier'])  # 只有一張，一定是代表張
         self.assertIn('舞台色彩|膚色|粉', x['hier'])
         self.assertIn('舞台色彩|整體|藍', x['hier'])
         self.assertIn('舞台色彩|段落|S01', x['hier'])
@@ -1003,17 +992,16 @@ class XmpTests(FakeRows, unittest.TestCase):
         self.assertTrue(os.path.exists(path))  # 被改過的不刪
 
     def test_disabled_features_not_written(self):
-        rows = self.make([['F.ARW']], [dict(person='P1')])
+        rows = self.make([['F.ARW']])
         rows[0]['bright'] = '中'
-        rows[0]['person'] = 'P1'
-        on = {'stars': False, 'rep': False, 'person': False, 'bright': False}
-        f = pcs.xmp_fields(rows[0], on)
+        on = {'stars': False, 'rep': False, 'bright': False}
+        f = pcs.xmp_fields(rows[0], on, label_mode='rep')
         self.assertEqual((f['rating'], f['label']), (None, None))
-        self.assertFalse([k for k in f['keywords'] if '|人物|' in k or '|亮度|' in k])
+        self.assertFalse([k for k in f['keywords'] if '|代表張' in k or '|亮度|' in k])
         f = pcs.xmp_fields(rows[0])
-        self.assertIn('舞台色彩|人物|P1', f['keywords'])
+        self.assertIn('舞台色彩|代表張', f['keywords'])
         self.assertIn('舞台色彩|亮度|中', f['keywords'])
-        new, _ = pcs.merge_xmp(None, pcs.xmp_fields(rows[0], on))
+        new, _ = pcs.merge_xmp(None, pcs.xmp_fields(rows[0], on, label_mode='none'))
         x = pcs.read_xmp(new)
         self.assertEqual((x['rating'], x['label']), ('', ''))
 
@@ -1166,3 +1154,37 @@ class LabelToolTests(unittest.TestCase):
         self.assertEqual(label_tool.KEY_COLORS['0'], '白')
         self.assertEqual(label_tool.KEY_COLORS['8'], '粉')
         self.assertNotIn('', label_tool.KEY_COLORS)
+
+
+class ColorLabelTests(FakeRows, unittest.TestCase):
+    """Lightroom 色標：依人（膚色）或依背景（整體），對到 Lightroom 的 5 種色標"""
+
+    def test_mapping_covers_every_color(self):
+        expect = {'紅': 'Red', '橙': 'Yellow', '黃': 'Yellow', '綠': 'Green', '青': 'Green',
+                  '藍': 'Blue', '紫': 'Purple', '粉': 'Purple', '白': None, '暗': None, '無': None}
+        for idx in range(len(pcs.CATEGORIES)):
+            r = dict(skin=idx, main=pcs.WHITE)
+            i = pcs.label_index(r, 'skin')
+            self.assertEqual(pcs.LR_LABELS[i] if i is not None else None, expect[pcs.label(idx)], pcs.label(idx))
+
+    def test_person_or_background(self):
+        rows = pcs.batch_features(self.rows([dict(skin=7, main=5, files=['A.ARW'], source='A.ARW')]))
+        self.assertEqual(pcs.xmp_fields(rows[0], label_mode='skin')['label'], 'Purple')  # 臉粉
+        self.assertEqual(pcs.xmp_fields(rows[0], label_mode='main')['label'], 'Blue')    # 背景藍
+        self.assertEqual(pcs.xmp_fields(rows[0], label_mode='rep')['label'], 'Red')      # 代表張
+        self.assertIsNone(pcs.xmp_fields(rows[0], label_mode='none')['label'])
+        self.assertIn('紫標', pcs.xmp_summary(rows[0], label_mode='skin'))
+        self.assertIn('藍標', pcs.xmp_summary(rows[0], label_mode='main'))
+
+    def test_custom_label_names(self):
+        rows = pcs.batch_features(self.rows([dict(main=5)]))
+        names = ['紅色', '黃色', '綠色', '藍色', '紫色']
+        self.assertEqual(pcs.xmp_fields(rows[0], label_mode='main', label_names=names)['label'], '藍色')
+        self.assertEqual(pcs.clean_label_names(['', 'Y', '', '', '']), ('Red', 'Y', 'Green', 'Blue', 'Purple'))
+        self.assertEqual(pcs.clean_label_names(['only', 'two']), pcs.LR_LABELS)  # 數量不對時用預設
+
+    def test_existing_label_still_kept(self):
+        data = LR_XMP  # 原本是 Green
+        new, kept = pcs.merge_xmp(data, {'rating': None, 'label': 'Blue', 'keywords': []})
+        self.assertEqual(pcs.read_xmp(new)['label'], 'Green')
+        self.assertIn('Label', kept)

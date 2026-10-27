@@ -44,6 +44,16 @@ MUTATIONS = [
      "return '%d人以上' % PEOPLE_MAX if n >= PEOPLE_MAX else '%d人' % n", "return '%d人' % n"),
     ('人數沒有寫進關鍵字', MAIN,
      ", '%s|人數|%s' % (XMP_ROOT, people_text(r['faces']))]", "]"),
+    # Lightroom 色標（依人／依背景）
+    ('依人／依背景沒有作用（一律用背景）', MAIN,
+     "return COLOR_TO_LABEL.get(r[label_mode])", "return COLOR_TO_LABEL.get(r['main'])"),
+    ('使用者設定的色標名稱沒有用', MAIN,
+     "'label': clean_label_names(label_names)[i] if i is not None else None", "'label': LR_LABELS[i] if i is not None else None"),
+    ('白光也加色標', MAIN,
+     "COLOR_TO_LABEL = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 4, 7: 4}",
+     "COLOR_TO_LABEL = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 4, 7: 4, 8: 0}"),
+    ('代表張沒有寫成關鍵字', MAIN,
+     "        kw.append('%s|代表張' % XMP_ROOT)\n", "        pass\n"),
     # 準確率評估
     ('比對檔名時沒去掉顏色前綴', EVAL,
      "return pcs.file_stem(pcs.strip_prefix(os.path.basename(name))).lower()",
