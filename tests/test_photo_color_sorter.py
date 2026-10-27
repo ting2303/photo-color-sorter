@@ -1188,3 +1188,50 @@ class ColorLabelTests(FakeRows, unittest.TestCase):
         new, kept = pcs.merge_xmp(data, {'rating': None, 'label': 'Blue', 'keywords': []})
         self.assertEqual(pcs.read_xmp(new)['label'], 'Green')
         self.assertIn('Label', kept)
+
+
+class CliUndoTests(unittest.TestCase):
+    """命令列 --undo：復原最近一次的改名或寫入 Lightroom 標籤"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def cli(self, *args):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        code = 0
+        with redirect_stdout(buf):
+            try:
+                pcs.run_cli([self.dir] + list(args))
+            except SystemExit as e:
+                code = e.code
+        return code, buf.getvalue()
+
+    def test_rename_then_undo(self):
+        save(os.path.join(self.dir, 'A.JPG'), solid((255, 0, 0)))
+        self.cli('--apply')
+        self.assertNotIn('A.JPG', os.listdir(self.dir))
+        code, out = self.cli('--undo')
+        self.assertEqual(code, 0)
+        self.assertIn('復原 1 個', out)
+        self.assertIn('A.JPG', os.listdir(self.dir))
+
+    def test_xmp_then_undo(self):
+        save(os.path.join(self.dir, 'B.JPG'), solid((255, 0, 0)))
+        with open(os.path.join(self.dir, 'B.ARW'), 'wb') as fp:
+            fp.write(b'raw')
+        self.cli('--apply', '--output', 'xmp', '--label', 'main')
+        x = pcs.read_xmp(open(os.path.join(self.dir, 'B.xmp'), 'rb').read())
+        self.assertEqual(x['label'], 'Blue')  # 整體藍 → 藍標
+        code, out = self.cli('--undo')
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'B.xmp')))
+
+    def test_undo_without_log(self):
+        code, out = self.cli('--undo')
+        self.assertEqual(code, 1)
+        self.assertIn('沒有可復原的紀錄', out)

@@ -8,12 +8,12 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
 功能：
   1. 偵測人臉，判斷「膚色被照成什麼顏色」（取臉部像素中佔最多數的色相）
   2. 判斷「整張照片的主要顏色」（忽略黑暗區域，以亮的有色光為主）
-  3. 輸出方式二選一：
+  3. 輸出方式三選一：
      改檔名：  DSC_1234.NEF  ->  6藍7紫_DSC_1234.NEF
                前 = 優先項目（預設膚色）、後 = 另一項，數字決定排序。
                匯入 Lightroom Classic 後用「檔案名稱」排序，就會依顏色排好。
      分資料夾：DSC_1234.NEF  ->  膚色6藍/整體7紫/DSC_1234.NEF
-     寫入 Lightroom 標籤：DSC_1234.NEF 旁邊的 DSC_1234.xmp 加上星等、代表張色標、「舞台色彩|…」關鍵字（不改檔名）
+     寫入 Lightroom 標籤：DSC_1234.NEF 旁邊的 DSC_1234.xmp 加上星等、色標（依人或依背景）、「舞台色彩|…」關鍵字（不改檔名）
 
   - RAW + JPG + XMP 同名檔會一起改名
   - 每次執行會在資料夾內留下紀錄 CSV，可一鍵復原
@@ -29,6 +29,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
               [--performer] [--csv 結果.csv] [--time-seq] [--report [報告.txt]]
               [--stage standard|pale] [--scenes auto|manual|both --splits "2921,3040"]
   還原修圖後檔名：python photo_color_sorter.py <輸出資料夾> --restore [--log-folder 原始資料夾] [--apply]
+  復原上一次：  python photo_color_sorter.py <資料夾> --undo
 """
 import os
 import re
@@ -47,7 +48,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.4.0'
+__version__ = '1.5.0'
 
 try:
     import rawpy
@@ -1243,7 +1244,7 @@ COLOR_TO_LABEL = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 4, 7: 4}
 LABEL_MODES = {'skin': '依人（膚色）', 'main': '依背景（整體）', 'rep': '只標代表張（紅標）', 'none': '不寫色標'}
 REP_LABEL = LR_LABELS[0]
 XMP_SKIP_EXTS = IMG_EXTS | {'.dng'}  # Lightroom 不讀這些格式旁邊的 .xmp（要寫進照片本身），本工具不寫
-XMP_SKIP_REASON = 'Lightroom 不讀 JPG、PNG、TIFF、DNG 旁邊的 .xmp，要改照片檔案本身才行；為了不動到照片，這些格式不寫入，請改用「改檔名」'
+XMP_SKIP_REASON = 'Lightroom 不讀 JPG、PNG、TIFF、BMP、WebP、DNG 旁邊的 .xmp，要改照片檔案本身才行；為了不動到照片，這些格式不寫入，請改用「改檔名」'
 _NS = {'x': 'adobe:ns:meta/', 'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
        'xmp': 'http://ns.adobe.com/xap/1.0/', 'dc': 'http://purl.org/dc/elements/1.1/',
        'lr': 'http://ns.adobe.com/lightroom/1.0/'}
@@ -2254,8 +2255,8 @@ def run_gui(initial_folder=None):
         if skipped:
             msg += '\n另外 %d 張是 JPG／PNG／TIFF／DNG，不會寫入。' % len(skipped)
         msg += ('\n\n・照片已經有星等或色標時，保留原本的，只補空的。'
-                '\n・照片已經匯入 Lightroom 的話，寫入後要在 Lightroom 選取這些照片，'
-                '按「中繼資料 → 從檔案讀取中繼資料」才會更新。'
+                '\n・照片已經匯入 Lightroom 的話：寫入前先在 Lightroom 選取這些照片按「中繼資料 → 將中繼資料儲存至檔案」（Ctrl+S），'
+                '寫入後再按「中繼資料 → 從檔案讀取中繼資料」。少了前一步，Lightroom 裡還沒存檔的修圖會被蓋掉。'
                 '\n・如果 Lightroom 開著「自動將變更寫入 XMP」，它可能會蓋掉本工具寫的內容。'
                 '\n\n要繼續嗎？')
         if not messagebox.askyesno('確認', msg):
@@ -2496,6 +2497,7 @@ def run_cli(argv):
     ap.add_argument('--splits', default='', metavar='號碼', help='從這些檔名號碼開始新段落，例如 "2921,3040,3074"')
     ap.add_argument('--report', nargs='?', const='-', metavar='PATH',
                     help='印出分析報告；給檔名則另外存成文字檔')
+    ap.add_argument('--undo', action='store_true', help='復原這個資料夾最近一次的改名、分資料夾或寫入 Lightroom 標籤')
     ap.add_argument('--restore', action='store_true', help='還原修圖輸出後的檔名（移除本工具加的前綴）')
     ap.add_argument('--log-folder', action='append', default=[], metavar='DIR',
                     help='搭配 --restore：原始照片所在的資料夾（讀它的改名紀錄），可指定多次')
@@ -2508,6 +2510,20 @@ def run_cli(argv):
         if out and not os.path.isdir(os.path.dirname(os.path.abspath(out))):
             print('無法存檔，資料夾不存在：%s' % os.path.dirname(os.path.abspath(out)))
             sys.exit(2)
+    if a.undo:
+        log = latest_log(a.folder)
+        if not log:
+            print('這個資料夾沒有可復原的紀錄')
+            sys.exit(1)
+        try:
+            n, errors = undo_log(log)
+        except Exception as e:
+            print('無法復原：%s' % e)
+            sys.exit(1)
+        print('已依照 %s 復原 %d 個檔案%s' % (os.path.basename(log), n, '，%d 個沒有復原' % len(errors) if errors else ''))
+        for path, err in errors[:20]:
+            print('  [沒有復原] %s：%s' % (os.path.basename(path), err))
+        return
     if a.restore:
         plan, by_log = plan_restore(a.folder, a.log_folder, a.recursive)
         print('找到 %d 個要還原的檔名（%d 個依改名紀錄，%d 個依前綴規則）' % (len(plan), by_log, len(plan) - by_log))
