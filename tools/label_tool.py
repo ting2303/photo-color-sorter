@@ -147,7 +147,7 @@ def run(folder, sample, use_all):
         if st['i'] >= len(todo):
             return
         k = e.keysym.lower()
-        ch = e.char
+        ch = e.char or (k[-1] if k.startswith('kp_') or len(k) == 1 else '')  # 數字鍵盤（kp_6）也可以用
         name = todo[st['i']]
         if k == 'escape':
             write_labels(out, labels)
@@ -196,6 +196,7 @@ def run(folder, sample, use_all):
         root.destroy()
         return
     show()
+    root.after(200, root.focus_force)  # 一打開就能直接按鍵，不用先點視窗
     root.mainloop()
 
 
