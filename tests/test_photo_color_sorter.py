@@ -447,8 +447,8 @@ class TimeSeqAndRestoreTests(unittest.TestCase):
         self.assertEqual(by_log, 2)
 
 
-class SixFeatureTests(unittest.TestCase):
-    """人物分組、亮度分組、自動評分、調色起點、分析報告"""
+class FakeRows:
+    """產生假分析結果的共用工具（不含測試）"""
 
     def rows(self, spec):
         """spec: [dict(覆蓋欄位)] -> 假的分析結果（已依時間排序）"""
@@ -471,6 +471,10 @@ class SixFeatureTests(unittest.TestCase):
         v = rng.normal(size=128)
         return (v / np.linalg.norm(v)).tolist()
 
+
+class SixFeatureTests(FakeRows, unittest.TestCase):
+    """人物分組、亮度分組、自動評分、調色起點、分析報告"""
+
     def test_person_groups(self):
         a, b = self.emb(1), self.emb(2)
         near = lambda v, k: (np.array(v) + 0.05 * np.array(self.emb(100 + k))).tolist()
@@ -489,7 +493,7 @@ class SixFeatureTests(unittest.TestCase):
     def test_stars(self):
         spec = [dict(sharp=0.1), dict(faces=0, face_px=0.0, face_bright=None, face_ab=None)]
         spec += [dict(sharp=5.0 + i, face_px=200.0) for i in range(6)]  # 清楚、臉大
-        spec += [dict(sharp=2.0, face_px=50.0)]
+        spec += [dict(sharp=4.8, face_px=50.0)]
         rows = pcs.batch_features(self.rows(spec))
         by = {r['source']: r for r in rows}
         self.assertEqual(by['P000.jpg']['stars'], 1)  # 最模糊
@@ -538,3 +542,87 @@ class SixFeatureTests(unittest.TestCase):
         spec = [dict(face_emb=a, face_bright=0.3) for _ in range(4)] + [dict(face_emb=b, face_bright=0.85) for _ in range(4)]
         rows = pcs.batch_features(self.rows(spec))
         self.assertEqual([r['bright'] for r in rows], ['亮'] * 8)
+
+
+class ReportFixTests(FakeRows, unittest.TestCase):
+    """第二輪穩定度測試找到的問題"""
+
+    def test_all_sharp_batch_has_no_blur_stars(self):
+        spec = [dict(sharp=1.0 + 0.003 * i) for i in range(30)]  # 全部清楚、差距很小
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertFalse([r for r in rows if r['star_why'] == '可能模糊'])
+
+    def test_strong_blur_always_flagged(self):
+        spec = [dict(sharp=1.0) for _ in range(5)] + [dict(sharp=0.5)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual(rows[-1]['star_why'], '可能模糊')
+
+    def test_dark_face_reason(self):
+        spec = [dict() for _ in range(5)] + [dict(face_bright=0.05, sharp=0.2)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual((rows[-1]['stars'], rows[-1]['star_why']), (1, '臉太暗'))
+
+    def test_grayscale_face_gets_no_wb(self):
+        spec = [dict() for _ in range(3)] + [dict(skin=pcs.WHITE, face_ab=(0.5, -0.8))]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual(pcs.wb_text(rows[-1]), '')
+
+    def test_report_wb_without_reference(self):
+        spec = [dict(skin=5, face_ab=(5.0, -20.0)) for _ in range(12)]  # 全部被藍光照到
+        lines, _ = pcs.build_report(pcs.batch_features(self.rows(spec)))
+        self.assertTrue(any('沒有在自然光下的臉可當基準' in x for x in lines))
+
+    def test_report_uncertain_advice_depends_on_option(self):
+        spec = [dict(main_ratio=0.3) for _ in range(12)]
+        _, off = pcs.build_report(pcs.batch_features(self.rows(spec)))
+        _, on = pcs.build_report(pcs.batch_features(self.rows(spec)), performer=True)
+        self.assertIn('可以勾「整體偏重演出者」', '\n'.join(off))
+        self.assertIn('已經勾了「整體偏重演出者」', '\n'.join(on))
+
+    def test_report_no_blur_note_when_no_faces(self):
+        spec = [dict(faces=0, face_px=0.0, face_bright=None, face_ab=None) for _ in range(12)]
+        _, notes = pcs.build_report(pcs.batch_features(self.rows(spec)))
+        text = '\n'.join(notes)
+        self.assertIn('沒偵測到臉', text)
+        self.assertNotIn('可能模糊', text)
+
+    def test_report_split_person_note(self):
+        a = self.emb(1)
+        spec = [dict(face_emb=a) for _ in range(8)] + [dict(face_emb=self.emb(10 + i)) for i in range(3)]
+        _, notes = pcs.build_report(pcs.batch_features(self.rows(spec)))
+        self.assertIn('只有 1～2 張', '\n'.join(notes))
+
+    def test_same_name_different_formats_are_separate(self):
+        d = tempfile.mkdtemp()
+        try:
+            save(os.path.join(d, 'x.jpg'), solid((255, 0, 0)))
+            ok, buf = cv2.imencode('.png', solid((0, 0, 255)))
+            buf.tofile(os.path.join(d, 'x.png'))
+            open(os.path.join(d, 'x.nef'), 'wb').close()
+            open(os.path.join(d, 'x.xmp'), 'wb').close()
+            groups = pcs.collect_groups(d)
+            self.assertEqual(sorted(g['source'] for g in groups), ['x.jpg', 'x.png'])
+            self.assertEqual(next(g for g in groups if g['source'] == 'x.jpg')['files'], ['x.jpg', 'x.nef', 'x.xmp'])
+            res = [pcs.analyze_group(g) for g in groups]
+            self.assertEqual(sorted(pcs.label(r['main']) for r in res), ['紅', '藍'])
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_friendly_errors(self):
+        d = tempfile.mkdtemp()
+        try:
+            open(os.path.join(d, 'empty.jpg'), 'wb').close()
+            with open(os.path.join(d, 'fake.nef'), 'wb') as fp:
+                fp.write(os.urandom(2000))
+            for g in pcs.collect_groups(d):
+                err = pcs.analyze_group(g)['error']
+                self.assertTrue(err.startswith(('無法讀取圖片', '不支援的 RAW 格式', '需要安裝 rawpy')), err)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dim_face_not_called_blurry(self):
+        """臉偏暗（0.12~0.2）時清晰度不可靠：不判模糊，2 星並說明臉太暗"""
+        spec = [dict() for _ in range(6)] + [dict(face_bright=0.16, sharp=0.4)]
+        rows = pcs.batch_features(self.rows(spec))
+        self.assertEqual(rows[-1]['stars'], 2)
+        self.assertIn('臉太暗', rows[-1]['star_why'])
