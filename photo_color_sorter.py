@@ -339,7 +339,11 @@ def detect_faces(img):
             return []
         out = []
         for f in faces:
-            if min(f[2], f[3]) >= 10:
+            # 臉框必須大致落在圖內：極細長或極小的圖，模型可能吐出比整張圖還大的假臉
+            if not np.all(np.isfinite(f[:4])):
+                continue
+            cx, cy = f[0] + f[2] / 2, f[1] + f[3] / 2
+            if min(f[2], f[3]) >= 10 and f[2] <= w and f[3] <= h and 0 <= cx < w and 0 <= cy < h:
                 face = Face((int(f[0]), int(f[1]), int(f[2]), int(f[3]), float(f[14])))
                 face.raw = f.copy()
                 out.append(face)
@@ -900,6 +904,27 @@ def _assign_wb(rows):
         r['wb_temp'], r['wb_tint'] = -db, -da
 
 
+TIMELINE_MAX_GAP = 600  # 時間軸：超過 10 分鐘的停頓（中場休息、相機時間設錯）只畫成 10 分鐘
+
+
+def timeline_positions(rows):
+    """時間軸上每張照片的位置（0~1，照時間排好的 rows）。
+    一半照拍攝時間、一半照張數平均排開：每張照片都看得到，時間的疏密也還在。
+    長停頓先壓縮成 10 分鐘，避免一張時間設錯的照片（例如 2099 年）或中場休息把其他照片全擠在一起；
+    時間都一樣時完全照順序平均排開"""
+    n = len(rows)
+    if n < 2:
+        return [0.0] * n
+    acc = [0.0]
+    for a, b in zip(rows, rows[1:]):
+        gap = (b['time'] - a['time']).total_seconds()
+        acc.append(acc[-1] + min(max(gap, 0.0), TIMELINE_MAX_GAP))
+    by_index = [i / (n - 1) for i in range(n)]
+    if acc[-1] < 1:
+        return by_index
+    return [0.5 * x / acc[-1] + 0.5 * i for x, i in zip(acc, by_index)]
+
+
 def wb_text(r):
     """調色起點建議的文字，例如「色溫−9 色調−6」；偏差很小時回傳「—」"""
     if r.get('wb_shift') is None:
@@ -988,6 +1013,10 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
             notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：畫面顏色很雜，背景 LED 螢幕很花時可以勾「整體偏重演出者」' % pct(unc))
     if n >= 5 and pct(noface) >= 50:
         notes.append('⚠ %.0f%% 的照片沒偵測到臉：膚色、人物分組、亮度與評分會較少，建議以「只看整體」分類' % pct(noface))
+    future = [r for r in ok if r['time'] > datetime.datetime.now() + datetime.timedelta(days=1)]
+    if future:
+        notes.append('ℹ %d 張的拍攝時間在未來（例如 %s，%s）：相機時間可能設錯，排序、段落與時間軸會不準'
+                     % (len(future), future[0]['source'], future[0]['time'].strftime('%Y-%m-%d')))
     if exif == 0:
         notes.append('ℹ 沒有讀到任何拍攝時間（可能是截圖、轉存或社群下載的照片），段落與時間序號改用檔案時間，順序可能不準')
     elif exif < n:
@@ -1020,6 +1049,12 @@ def report_text(rows, mode='both', order='skin', folder=None, performer=False, f
     return '\n'.join(head + [''] + lines + ['', '需要注意：'] + notes) + '\n'
 
 
+def _cell(s):
+    """檔名以 = + - @ 開頭時，Excel 會當成公式執行；前面加 ' 讓它只當文字"""
+    s = str(s)
+    return "'" + s if s[:1] in ('=', '+', '-', '@') else s
+
+
 def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False, features=None):
     """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟；關掉的挑圖功能欄位留空"""
     on = dict(ALL_FEATURES, **(features or {}))
@@ -1030,12 +1065,12 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
                      '結果', '錯誤'])
         for r in rows:
             if r.get('error'):
-                wr.writerow([r['source']] + [''] * 19 + [r['error']])
+                wr.writerow([_cell(r['source'])] + [''] * 19 + [r['error']])
                 continue
             clean = strip_prefix(r['source'])
             new = (os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
                    else build_prefix(r, mode, order, digits, time_seq) + clean)
-            wr.writerow([r['source'], r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
+            wr.writerow([_cell(r['source']), r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
                          'S%02d' % r['scene'], '★' if r['rep'] and on['rep'] else '', r['sharp_score'],
                          r.get('stars', '') if on['stars'] else '', r.get('star_why', '') if on['stars'] else '',
                          (r.get('person') or '') if on['person'] else '', (r.get('bright') or '') if on['bright'] else '',
@@ -1043,7 +1078,7 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
                          label(r['skin']), '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                          label(r['main']), '%d%%' % (r['main_ratio'] * 100),
                          ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top']),
-                         '%d%%' % (r['highlight'] * 100), '?' if r['uncertain'] else '', new, ''])
+                         '%d%%' % (r['highlight'] * 100), '?' if r['uncertain'] else '', _cell(new), ''])
 
 
 def label(idx):
@@ -1107,9 +1142,18 @@ def apply_renames(plan, log_dir):
         n += 1
         log_path = os.path.join(log_dir, LOG_PREFIX + '%s_%d.csv' % (stamp, n))
     done, errors = [], []
-    fp = None
+    if not plan:
+        return done, errors, None
+    # 先建立紀錄檔再改名：寫不了紀錄（唯讀、磁碟滿）就一個都不改，避免改了卻無法復原
     try:
-        for old, new in plan:
+        fp = open(log_path, 'w', newline='', encoding='utf-8-sig')
+        writer = csv.writer(fp)
+        writer.writerow(['old', 'new'])
+        fp.flush()
+    except OSError as e:
+        return done, [(old, '無法建立改名紀錄，為了能復原所以沒有改名：%s' % e) for old, _ in plan], None
+    try:
+        for i, (old, new) in enumerate(plan):
             try:
                 if not (is_inside(old, log_dir) and is_inside(new, log_dir)):
                     raise PermissionError('路徑不在所選資料夾內')
@@ -1121,15 +1165,24 @@ def apply_renames(plan, log_dir):
                 errors.append((old, str(e)))
                 continue
             done.append((old, new))
-            if fp is None:
-                fp = open(log_path, 'w', newline='', encoding='utf-8-sig')
-                writer = csv.writer(fp)
-                writer.writerow(['old', 'new'])
-            writer.writerow([old, new])
-            fp.flush()
+            try:
+                writer.writerow([old, new])
+                fp.flush()
+            except OSError as e:  # 紀錄寫不進去：把這一筆改回來，後面的也不做了
+                try:
+                    os.rename(new, old)
+                    done.pop()
+                except OSError:
+                    pass
+                errors += [(o, '紀錄檔寫入失敗，已停止：%s' % e) for o, _ in plan[i:]]
+                break
     finally:
-        if fp:
-            fp.close()
+        fp.close()
+    if not done:
+        try:
+            os.remove(log_path)
+        except OSError:
+            pass
     return done, errors, (log_path if done else None)
 
 
@@ -1271,6 +1324,7 @@ def run_gui(initial_folder=None):
     root = tk.Tk()
     root.title('舞台照片色彩分類工具 v%s　© 2026 ting2303・僅限非商業用途' % __version__)
     root.geometry('1180x720')
+    root.minsize(900, 560)
 
     folder = tk.StringVar()
     recursive = tk.BooleanVar(value=False)
@@ -1305,7 +1359,8 @@ def run_gui(initial_folder=None):
                    (adv_open, 'adv_open'), (group_scene, 'group_scene')):
         if isinstance(saved.get(k), bool):
             var.set(saved[k])
-    for k, v in (saved.get('features') or {}).items():
+    feats = saved.get('features')
+    for k, v in (feats.items() if isinstance(feats, dict) else ()):
         if k in feat and isinstance(v, bool):
             feat[k].set(v)
 
@@ -1424,11 +1479,11 @@ def run_gui(initial_folder=None):
     for t, v in (('自動', 'auto'), ('手動', 'manual'), ('自動＋手動', 'both')):
         ttk.Radiobutton(a3, text=t, value=v, variable=scene_mode, command=on_scene).pack(side='left')
     ttk.Label(a3, text='　從這些檔名號碼開始新段落：').pack(side='left')
-    e_split = ttk.Entry(a3, textvariable=splits_text, width=32)
+    e_split = ttk.Entry(a3, textvariable=splits_text, width=24)
     e_split.pack(side='left')
     e_split.bind('<Return>', lambda e: on_scene())
     ttk.Button(a3, text='套用', command=on_scene).pack(side='left', padx=4)
-    ttk.Label(a3, text='例：2921, 3040, 3074', foreground='#777').pack(side='left', padx=6)
+    ttk.Label(a3, text='例：2921, 3040', foreground='#777').pack(side='left', padx=6)
     a4 = ttk.Frame(adv)
     a4.pack(fill='x', pady=(4, 0))
     ttk.Label(a4, text='挑圖功能：').pack(side='left')
@@ -1445,7 +1500,7 @@ def run_gui(initial_folder=None):
         tk.Label(legend, text=' %s ' % tag(i), bg=SWATCH_COLORS[i], fg='#ffffff' if i in (5, 6, DARK) else '#111111',
                  bd=0, padx=1).pack(side='left', padx=1)
     ttk.Label(legend, foreground='#555',
-              text='　左邊小方塊：左半＝膚色、右半＝整體　｜　★ 代表張：每段先修這張　｜　其他說明在選單「說明」').pack(side='left')
+              text='　小方塊：左膚色｜右整體　★ 代表張＝每段先修').pack(side='left')
 
     def toggle_adv(flip=False):
         if flip:
@@ -1472,7 +1527,7 @@ def run_gui(initial_folder=None):
                             '亮度：和同一人最亮的照片比\n'
                             '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案\n'
                             '整體後的 ?：主色票數偏低，建議人工確認\n'
-                            '燈光爆點：很亮又沒顏色的部分（不參與投票）佔亮處的比例\n'
+                            '燈光爆點：很亮又沒顏色的部分佔亮處的比例（爆點少時不參與判斷顏色）\n'
                             '時間後的 *：沒有拍攝時間，改用檔案時間')
 
     btns = ttk.Frame(root, padding=8)
@@ -1552,25 +1607,21 @@ def run_gui(initial_folder=None):
             tl_frame.pack(fill='x', before=frame)
         W = max(tl.winfo_width(), 400)
         L, R = 44, 10
-        t0, t1 = rs[0]['time'], rs[-1]['time']
-        span = (t1 - t0).total_seconds()
-        if span < 1:
-            xs = [L + (W - L - R) * i / max(len(rs) - 1, 1) for i in range(len(rs))]
-        else:
-            xs = [L + (W - L - R) * (r['time'] - t0).total_seconds() / span for r in rs]
+        xs = [L + (W - L - R) * f for f in timeline_positions(rs)]
         state['tl_x'] = xs
         tl.create_text(4, 12, text='整體', anchor='w', font=('Microsoft JhengHei UI', 8), fill='#555')
         tl.create_text(4, 30, text='膚色', anchor='w', font=('Microsoft JhengHei UI', 8), fill='#555')
         last = -100
+        widest = max(3 * (W - L - R) / len(rs), 3)  # 長停頓留白，不把前一張畫得很長
         for i, r in enumerate(rs):
             x0 = xs[i]
-            x1 = max(xs[i + 1] if i + 1 < len(rs) else x0 + 3, x0 + 2)
+            x1 = max(min(xs[i + 1] if i + 1 < len(rs) else x0 + 3, x0 + widest), x0 + 2)
             tl.create_rectangle(x0, 4, x1, 20, fill=SWATCH_COLORS[r['main']], outline='')
             tl.create_rectangle(x0, 22, x1, 38, fill=SWATCH_COLORS[r['skin']], outline='')
             if not i or r['scene'] != rs[i - 1]['scene']:
                 if i:
                     tl.create_line(x0, 2, x0, 42, fill='#222', dash=(2, 2))
-                if x0 - last >= 26:
+                if x0 - last >= 26 and x0 <= W - 30:  # 太靠右邊的標籤會被切掉，不畫
                     tl.create_text(x0 + 2, 52, text='S%02d' % r['scene'], anchor='w',
                                    font=('Segoe UI', 7), fill='#333')
                     last = x0
@@ -1681,6 +1732,13 @@ def run_gui(initial_folder=None):
             return None
         return f
 
+    def same_folder(f):
+        """分析完才換資料夾時，表格還是舊資料夾的結果，不能拿來改名或匯出"""
+        if state['results'] and state.get('folder') and os.path.abspath(f) != state['folder']:
+            messagebox.showwarning('提示', '資料夾已經換了，表格還是上一個資料夾的結果。\n請先按「① 分析」重新分析。')
+            return False
+        return True
+
     def start_analysis():
         f = check_folder()
         if not f:
@@ -1696,6 +1754,7 @@ def run_gui(initial_folder=None):
 
         person_on = feat['person'].get()
         state['person_done'] = person_on
+        state['folder'] = os.path.abspath(f)
 
         def worker():
             try:
@@ -1737,6 +1796,8 @@ def run_gui(initial_folder=None):
             return
         if not state['results']:
             messagebox.showinfo('提示', '請先按「① 分析」')
+            return
+        if not same_folder(f):
             return
         is_folder = output.get() == 'folder'
         rows, _ = current_rows()  # 已套用「偏重演出者」並算好拍攝時間序號
@@ -1787,6 +1848,8 @@ def run_gui(initial_folder=None):
         if not state['results']:
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
+        if not same_folder(f):
+            return
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         path, k = os.path.join(f, '_色彩分析_%s.csv' % stamp), 1
         while os.path.exists(path):  # 同一秒內重複匯出不覆蓋
@@ -1820,7 +1883,7 @@ def run_gui(initial_folder=None):
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
         rows, _ = current_rows()
-        text = report_text(rows, mode.get(), order.get(), folder.get().strip(), performer.get(), features_now())
+        text = report_text(rows, mode.get(), order.get(), state.get('folder') or folder.get().strip(), performer.get(), features_now())
         win = tk.Toplevel(root)
         win.title('分析報告')
         win.geometry('720x520')
@@ -1843,7 +1906,7 @@ def run_gui(initial_folder=None):
         bar.pack(fill='x')
 
         def save():
-            f = folder.get().strip()
+            f = state.get('folder') or folder.get().strip()
             if not f or not os.path.isdir(f):
                 return
             stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1871,17 +1934,17 @@ def run_gui(initial_folder=None):
         cv = tk.Canvas(win, width=W, height=H, background='white')
         cv.pack(fill='both', expand=True)
         t0, t1 = rows[0]['time'], rows[-1]['time']
-        span = max((t1 - t0).total_seconds(), 1.0)
-        # 照片太少或時間都一樣時，改成照順序平均排開
+        # 照片太少或時間都一樣時，改成照順序平均排開；長停頓壓縮成 10 分鐘
         use_index = (t1 - t0).total_seconds() < 1
-        xs = [L + (W - L - R) * ((i / max(len(rows) - 1, 1)) if use_index else
-                                 (r['time'] - t0).total_seconds() / span) for i, r in enumerate(rows)]
+        squeezed = any((b['time'] - a['time']).total_seconds() > TIMELINE_MAX_GAP for a, b in zip(rows, rows[1:]))
+        xs = [L + (W - L - R) * f for f in timeline_positions(rows)]
         cv.create_text(8, 70, text='整體主色', anchor='w')
         cv.create_text(8, 130, text='膚色', anchor='w')
         cv.create_text(8, 180, text='照片', anchor='w')
+        widest = max(3 * (W - L - R) / len(rows), 4)
         for i, r in enumerate(rows):
             x0 = xs[i]
-            x1 = xs[i + 1] if i + 1 < len(rows) else x0 + 4
+            x1 = min(xs[i + 1] if i + 1 < len(rows) else x0 + 4, x0 + widest)
             x1 = max(x1, x0 + 2)
             cv.create_rectangle(x0, 50, x1, 90, fill=TAG_COLORS[r['main']], outline='')
             cv.create_rectangle(x0, 110, x1, 150, fill=TAG_COLORS[r['skin']], outline='')
@@ -1893,12 +1956,14 @@ def run_gui(initial_folder=None):
         last_x = -100
         for s in sorted({r['scene'] for r in rows}):
             first = next(i for i, r in enumerate(rows) if r['scene'] == s)
-            if xs[first] - last_x >= 28:  # 段落太近時不畫標籤，避免文字疊在一起
+            if xs[first] - last_x >= 28 and xs[first] <= W - R - 24:  # 段落太近或太靠右時不畫標籤
                 cv.create_text(xs[first] + 2, 30, text='S%02d' % s, anchor='w', font=('Segoe UI', 8))
                 last_x = xs[first]
-        cv.create_text(L, H - 20, anchor='w', text=t0.strftime('%H:%M:%S'))
-        cv.create_text(W - R, H - 20, anchor='e', text=t1.strftime('%H:%M:%S'))
-        cv.create_text(W / 2, H - 20, text='虛線 = 段落交界　★ = 代表張' + ('　（沒有拍攝時間，照順序排列）' if use_index else ''))
+        fmt = '%H:%M:%S' if t0.date() == t1.date() else '%Y-%m-%d %H:%M'  # 跨日時加上日期
+        cv.create_text(L, H - 20, anchor='w', text=t0.strftime(fmt))
+        cv.create_text(W - R, H - 20, anchor='e', text=t1.strftime(fmt))
+        cv.create_text(W / 2, H - 20, text='虛線 = 段落交界　★ = 代表張' + ('　（沒有拍攝時間，照順序排列）' if use_index else
+                                                                  '　（超過 10 分鐘的停頓已壓縮）' if squeezed else ''))
 
     def do_restore():
         f = check_folder()
@@ -1975,6 +2040,10 @@ def run_cli(argv):
     if not os.path.isdir(a.folder):
         print('找不到資料夾：%s' % a.folder)
         sys.exit(2)
+    for out in (a.csv, a.report if a.report != '-' else None):  # 先檢查輸出位置，免得分析完才失敗
+        if out and not os.path.isdir(os.path.dirname(os.path.abspath(out))):
+            print('無法存檔，資料夾不存在：%s' % os.path.dirname(os.path.abspath(out)))
+            sys.exit(2)
     if a.restore:
         plan, by_log = plan_restore(a.folder, a.log_folder, a.recursive)
         print('找到 %d 個要還原的檔名（%d 個依改名紀錄，%d 個依前綴規則）' % (len(plan), by_log, len(plan) - by_log))
@@ -1982,7 +2051,7 @@ def run_cli(argv):
             print('  %s -> %s' % (os.path.basename(old), os.path.basename(new)))
         if a.apply:
             done, errors, log = apply_renames(plan, a.folder)
-            print('已還原 %d 個，失敗 %d 個，紀錄：%s' % (len(done), len(errors), log))
+            print('已還原 %d 個，失敗 %d 個%s' % (len(done), len(errors), '，紀錄：%s' % log if log else ''))
         else:
             print('（預覽模式，加上 --apply 才會執行）')
         return
@@ -1991,6 +2060,8 @@ def run_cli(argv):
     results = run_analysis(groups, progress=lambda i, n: print('\r%d/%d' % (i, n), end='', flush=True), stage=a.stage)
     print()
     splits = parse_splits(a.splits)
+    if a.scenes != 'auto' and not splits:
+        print('沒有讀到分段號碼（--splits），%s' % ('整批當成一段' if a.scenes == 'manual' else '只用自動分段'))
     rows = batch_features(results, a.mode, a.order, a.performer, a.scenes, splits)
     if splits and a.scenes != 'auto':
         ok = [r for r in rows if not r.get('error')]
@@ -2021,7 +2092,9 @@ def run_cli(argv):
         print('  %s -> %s' % (os.path.basename(old), os.path.relpath(new, os.path.dirname(old))))
     if a.apply:
         done, errors, log = apply_renames(plan, a.folder)
-        print('已處理 %d 個，失敗 %d 個，紀錄：%s' % (len(done), len(errors), log))
+        print('已處理 %d 個，失敗 %d 個%s' % (len(done), len(errors), '，紀錄：%s' % log if log else ''))
+        for old, err in errors[:20]:
+            print('  [失敗] %s：%s' % (os.path.basename(old), err))
     else:
         print('（預覽模式，加上 --apply 才會執行）')
 
