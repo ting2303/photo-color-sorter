@@ -32,7 +32,8 @@ jobs:
         shell: pwsh
         run: |
           $v = (Select-String -Path photo_color_sorter.py -Pattern "__version__ = '(.+)'").Matches[0].Groups[1].Value
-          if ("v$v" -ne $env:TAG) { throw "程式版本 v$v 和標籤 $env:TAG 不一致" }
+          $base = ($env:TAG -split '-')[0]  # v1.4.0-rc1 這類測試版只比對前面的版本號
+          if ("v$v" -ne $base) { throw "程式版本 v$v 和標籤 $env:TAG 不一致" }
 
       - name: 用微軟正黑體重新產生使用教學 PDF（頁數不對就保留原本的）
         shell: pwsh
@@ -70,7 +71,7 @@ jobs:
           Compress-Archive -Path dist\PhotoColorSorter -DestinationPath PhotoColorSorter-Windows.zip -Force
           $h = (Get-FileHash PhotoColorSorter-Windows.zip -Algorithm SHA256).Hash.ToLower()
           $mb = [math]::Round((Get-Item PhotoColorSorter-Windows.zip).Length / 1MB)
-          $notes = "docs\release-notes\$env:TAG.md"
+          $notes = "docs\release-notes\$(($env:TAG -split '-')[0]).md"
           if (-not (Test-Path $notes)) { throw "找不到發布說明 $notes" }
           $body = (Get-Content $notes -Raw -Encoding UTF8).Replace('{SHA256}', $h).Replace('{SIZE_MB}', "$mb")
           Set-Content -Path release-notes.md -Value $body -Encoding UTF8
@@ -87,5 +88,9 @@ jobs:
             gh release upload $env:TAG PhotoColorSorter-Windows.zip --clobber
             gh release edit $env:TAG --title $title --notes-file release-notes.md
           } else {
-            gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --latest
+            if ($env:TAG.Contains('-')) {  # 測試版：標成預先發行，不會變成「最新版本」
+              gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --prerelease
+            } else {
+              gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --latest
+            }
           }
