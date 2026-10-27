@@ -88,7 +88,14 @@ After analysis the table shows a few extra columns to help you decide what to ed
 | 亮度 (brightness) | 亮/中/暗 (bright/mid/dim) compared with that person's brightest photos, so spotlight changes within a song can be synced separately |
 | 調色起點 (WB start) | Direction and strength of the face color cast, e.g. 色溫+20 色調-12 = warmer and greener. A suggestion only: nothing is written to files, and the numbers are not exact Lightroom slider values |
 
-New options:
+The main window keeps only the common settings. Everything else is under 進階設定 (advanced, press 進階設定 ▸), less-used tools are in the 工具 (tools) menu, and all columns are under 顯示 → 顯示所有欄位 (view → all columns).
+
+Manual controls in the advanced panel:
+
+- **燈光段落 (scenes): auto / manual / auto + manual**: type file numbers (e.g. `2921, 3040, 3074`) to start a new scene at those photos. Without an exact match the nearest larger number is used; numbers that match nothing are listed in the status bar
+- **舞台顏色 (stage colour): standard / pale**: try 淡色舞台 (pale) when the whole show's lighting is faint and most photos come out white. The trade-off: genuine white-light scenes get classed as coloured, and already-graded photos tend to read skin as red light, so compare with standard before using it. The analysis report warns about this
+
+Other options:
 
 - **整體偏重演出者 (weight the performer)**: tick it when the LED wall behind is very colorful, so the light around the performer counts more
 - **表格排序 (table order)**: by capture time, filename or color

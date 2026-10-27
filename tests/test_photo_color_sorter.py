@@ -626,3 +626,66 @@ class ReportFixTests(FakeRows, unittest.TestCase):
         rows = pcs.batch_features(self.rows(spec))
         self.assertEqual(rows[-1]['stars'], 2)
         self.assertIn('臉太暗', rows[-1]['star_why'])
+
+
+class ManualControlTests(FakeRows, unittest.TestCase):
+    """手動分段、舞台顏色濃淡"""
+
+    def test_file_number_and_parse(self):
+        self.assertEqual(pcs.file_number('DSC02921'), 2921)
+        self.assertEqual(pcs.file_number('20260131-DSC05088'), 5088)
+        self.assertIsNone(pcs.file_number('cover'))
+        self.assertEqual(pcs.parse_splits('3040, 2921  3074，3040'), [2921, 3040, 3074])
+
+    def spec10(self):
+        return [dict(stem='DSC%05d' % (100 + i), source='DSC%05d.jpg' % (100 + i)) for i in range(10)]
+
+    def test_manual_splits(self):
+        rows = pcs.batch_features(self.rows(self.spec10()), scene_mode='manual', splits=[103, 107])
+        self.assertEqual([r['scene'] for r in rows], [1, 1, 1, 2, 2, 2, 2, 3, 3, 3])
+
+    def test_manual_split_nearest_bigger_and_missing(self):
+        spec = [s for s in self.spec10() if s['stem'] != 'DSC00105']
+        ok = sorted(self.rows(spec), key=lambda r: r['time'])
+        idx, missing = pcs.match_splits(ok, [105, 999])
+        self.assertEqual([ok[i]['stem'] for i in idx], ['DSC00106'])  # 沒有 105，用最接近的 106
+        self.assertEqual(missing, [999])
+
+    def test_both_mode_adds_to_auto(self):
+        spec = self.spec10()
+        for s in spec[5:]:
+            s.update(main=0)  # 後半段換紅光 -> 自動在第 6 張切
+        auto = [r['scene'] for r in pcs.batch_features(self.rows(spec))]
+        both = [r['scene'] for r in pcs.batch_features(self.rows(spec), scene_mode='both', splits=[102])]
+        self.assertEqual(auto, [1] * 5 + [2] * 5)
+        self.assertEqual(both, [1, 1, 2, 2, 2, 3, 3, 3, 3, 3])
+        self.assertEqual(len([r for r in pcs.batch_features(self.rows(spec), scene_mode='both', splits=[102])
+                              if r['rep']]), 3)  # 每段都有代表張
+
+    def test_stage_preset_changes_thresholds(self):
+        try:
+            pcs.apply_stage_preset('pale')
+            self.assertEqual(pcs.NEUTRAL_S, 0.14)
+            self.assertEqual(pcs.SKIN_NEUTRAL_S, 0.08)
+        finally:
+            pcs.apply_stage_preset('standard')
+        self.assertEqual(pcs.NEUTRAL_S, 0.25)
+
+    def test_pale_stage_catches_pale_light(self):
+        """淡藍色燈光：標準設定判白，淡色舞台設定判藍"""
+        d = tempfile.mkdtemp()
+        try:
+            save(os.path.join(d, 'pale.jpg'), solid((235, 205, 185)))  # 飽和度約 0.21
+            g = pcs.collect_groups(d)[0]
+            self.assertEqual(pcs.label(pcs.analyze_group(g)['main']), '白')
+            self.assertEqual(pcs.label(pcs.analyze_group(g, 'pale')['main']), '藍')
+            self.assertEqual(pcs.analyze_group(g, 'pale')['stage'], 'pale')
+            self.assertEqual(pcs.NEUTRAL_S, 0.14)
+        finally:
+            pcs.apply_stage_preset('standard')
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_report_mentions_pale_stage(self):
+        spec = [dict(stage='pale', skin=0) for _ in range(10)]
+        _, notes = pcs.build_report(pcs.batch_features(self.rows(spec)))
+        self.assertIn('建議改回「標準」', '\n'.join(notes))
