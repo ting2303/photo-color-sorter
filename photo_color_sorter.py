@@ -935,6 +935,23 @@ def wb_text(r):
     return '色溫%+d 色調%+d' % (round(r['wb_temp']), round(r['wb_tint']))
 
 
+def people_text(n):
+    """偵測到的人數（臉數）。5 人以上合併成「5人以上」，分組時才不會太碎"""
+    return '%d人以上' % PEOPLE_MAX if n >= PEOPLE_MAX else '%d人' % n
+
+
+PEOPLE_MAX = 5
+
+
+def people_dist(rows):
+    """「0人 120、1人 300、2人 80…」：每種人數各有幾張"""
+    c = {}
+    for r in rows:
+        k = min(r['faces'], PEOPLE_MAX)
+        c[k] = c.get(k, 0) + 1
+    return '、'.join('%s %d' % (people_text(k), c[k]) for k in sorted(c))
+
+
 def build_report(rows, mode='both', order='skin', performer=False, features=None):
     """分析報告：整批結果的統計，以及需要注意的地方。回傳 (摘要行清單, 提醒清單)。
     提醒依「⚠ 需要注意」與「ℹ 參考」分級，讓使用者知道這次的結果可不可靠、該怎麼調。"""
@@ -955,6 +972,7 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
         return '、'.join('%s %d' % (label(k), v) for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
     lines.append('整體主色：' + dist('main'))
     lines.append('膚色：' + dist('skin'))
+    lines.append('偵測到的人數：' + people_dist(ok))
     exif = sum(r['time_src'] == 'EXIF' for r in ok)
     lines.append('拍攝時間：%d 張讀到 EXIF（%.0f%%）' % (exif, pct(exif)))
     scenes = len({r['scene'] for r in ok})
@@ -1062,7 +1080,7 @@ def export_csv(rows, path, mode='both', order='skin', digits=True, output='renam
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
         wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '人物', '亮度',
-                     '調色起點建議', '臉數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
+                     '調色起點建議', '人數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
                      '結果', '錯誤'])
         for r in rows:
             if r.get('error'):
@@ -1331,7 +1349,7 @@ def xmp_fields(r, features=None):
     關掉的挑圖功能不寫。顏色與段落一律寫（它們是分類本身，不是挑圖功能）"""
     on = dict(ALL_FEATURES, **(features or {}))
     kw = ['%s|膚色|%s' % (XMP_ROOT, label(r['skin'])), '%s|整體|%s' % (XMP_ROOT, label(r['main'])),
-          '%s|段落|S%02d' % (XMP_ROOT, r['scene'])]
+          '%s|段落|S%02d' % (XMP_ROOT, r['scene']), '%s|人數|%s' % (XMP_ROOT, people_text(r['faces']))]
     if on['person'] and r.get('person'):
         kw.append('%s|人物|%s' % (XMP_ROOT, r['person']))
     if on['bright'] and r.get('bright'):
@@ -1362,6 +1380,7 @@ def xmp_summary(r, features=None):
         parts.append('紅標')
     parts.append('%s/%s' % (label(r['skin']), label(r['main'])))
     parts.append('S%02d' % r['scene'])
+    parts.append(people_text(r['faces']))
     return ' '.join(parts)
 
 
@@ -1919,6 +1938,8 @@ def run_gui(initial_folder=None):
                             '整體後的 ?：主色票數偏低，建議人工確認\n'
                             '燈光爆點：很亮又沒顏色的部分佔亮處的比例（爆點少時不參與判斷顏色）\n'
                             '時間後的 *：沒有拍攝時間，改用檔案時間\n\n'
+                            '開啟照片：點「原檔名」，或在任一列按兩下／按 Enter；按右鍵可以在檔案總管中顯示\n'
+                            '人數：偵測到幾張臉（遠處太小、背對、太暗的臉不會算進去）\n\n'
                             '寫入 Lightroom 標籤（進階設定 → 輸出方式）：把星等、代表張紅色標、'
                             '顏色／段落／人物／亮度關鍵字（在「舞台色彩」底下）寫進 RAW 旁邊的 .xmp，不改檔名。'
                             '已有的星等和色標會保留。JPG、PNG、TIFF、DNG 不寫入')
@@ -1937,10 +1958,10 @@ def run_gui(initial_folder=None):
     # --- 預覽表格：預設只顯示挑圖最常用的欄位
     cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'person', 'bright', 'wb', 'faces', 'skin', 'skin_r',
             'main', 'main_r', 'top', 'hl', 'new')
-    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '臉數', '膚色', '膚色比例',
+    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '人數', '膚色', '膚色比例',
              '整體', '整體比例', '整體組成', '燈光爆點', '結果')
-    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 40, 45, 65, 50, 65, 160, 65, 300)
-    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'skin', 'main', 'new')
+    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 45, 45, 65, 50, 65, 160, 65, 300)
+    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'faces', 'skin', 'main', 'new')
     feat_cols = {'rep': 'rep', 'stars': 'stars', 'person': 'person', 'bright': 'bright', 'wb': 'wb'}
 
     # 燈光時間軸色帶：整場的整體主色與膚色，點一下跳到那一段
@@ -2071,6 +2092,7 @@ def run_gui(initial_folder=None):
 
     def refresh_table():
         tree.delete(*tree.get_children())
+        state['paths'] = {}  # 表格列 -> 照片完整路徑（點檔名開啟用）
         rows, sort_key = current_rows()
         f = features_now()
         grouped = group_scene.get() and sort_by.get() == 'time'
@@ -2095,8 +2117,9 @@ def run_gui(initial_folder=None):
                                          values=[vals[c] for c in cols], tags=('scenehdr',))
         for r in rows:
             if r.get('error'):
-                tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
-                            tags=('err',))
+                iid = tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
+                                  tags=('err',))
+                state['paths'][iid] = os.path.join(r['dir'], r['source'])
                 continue
             clean = strip_prefix(r['source'])
             if output.get() == 'xmp':
@@ -2110,7 +2133,7 @@ def run_gui(initial_folder=None):
                 new += '  (+%d 個同名檔)' % extra
             top3 = ' '.join('%s%d%%' % (label(i), p * 100) for i, p in r['top'])
             t = r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*')
-            tree.insert(parents.get(r['scene'], '') if grouped else '', 'end', tags=('c%d' % r[sort_key],),
+            state['paths'][tree.insert(parents.get(r['scene'], '') if grouped else '', 'end', tags=('c%d' % r[sort_key],),
                         image=swatch(r['skin'], r['main']), values=(
                 r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] and f['rep'] else '',
                 '★' * r['stars'] if f['stars'] else '', r['sharp_score'],
@@ -2118,8 +2141,52 @@ def run_gui(initial_folder=None):
                 wb_text(r) if f['wb'] else '', r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                 label(r['main']) + ('?' if r['uncertain'] else ''), '%d%%' % (r['main_ratio'] * 100), top3,
-                '%d%%' % (r.get('highlight', 0) * 100), new))
+                '%d%%' % (r.get('highlight', 0) * 100), new))] = os.path.join(r['dir'], r['source'])
         draw_timeline(rows)
+
+    def open_photo(iid, reveal=False):
+        """用 Windows 預設的看圖程式開啟照片；reveal=True 時在檔案總管中選取它"""
+        path = state.get('paths', {}).get(iid)
+        if not path:
+            return
+        import time
+        last = state.get('last_open')
+        if not reveal and last and last[0] == path and time.monotonic() - last[1] < 1.0:
+            return  # 點一下＋按兩下會連續觸發，一秒內同一張只開一次
+        state['last_open'] = (path, time.monotonic())
+        if not os.path.exists(path):
+            messagebox.showwarning('找不到照片', '這張照片已經不在原來的位置（可能改名或搬走了），請重新分析。\n\n%s' % path)
+            return
+        try:
+            if reveal:
+                import subprocess
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+            else:
+                os.startfile(path)
+        except Exception as e:
+            messagebox.showerror('無法開啟', '沒有可以開啟這種檔案的程式，或開啟失敗：\n%s' % e)
+
+    def on_tree_click(e):
+        # 點「原檔名」那一格就開啟照片；點其他地方只是選取
+        iid = tree.identify_row(e.y)
+        if iid and tree.identify_region(e.x, e.y) == 'cell' and tree.identify_column(e.x) == '#1':
+            open_photo(iid)
+
+    tree_menu = tk.Menu(root, tearoff=0)
+    tree_menu.add_command(label='開啟照片', command=lambda: open_photo(tree.focus()))
+    tree_menu.add_command(label='在檔案總管中顯示', command=lambda: open_photo(tree.focus(), reveal=True))
+
+    def on_tree_menu(e):
+        iid = tree.identify_row(e.y)
+        if iid in state.get('paths', {}):
+            tree.selection_set(iid)
+            tree.focus(iid)
+            tree_menu.tk_popup(e.x_root, e.y_root)
+
+    tree.bind('<ButtonRelease-1>', on_tree_click)
+    tree.bind('<Double-1>', lambda e: open_photo(tree.identify_row(e.y)))
+    tree.bind('<Return>', lambda e: open_photo(tree.focus()))
+    tree.bind('<Button-3>', on_tree_menu)
 
     def check_folder():
         f = folder.get().strip()

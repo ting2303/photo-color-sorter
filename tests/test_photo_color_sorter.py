@@ -1081,3 +1081,88 @@ class XmpTests(FakeRows, unittest.TestCase):
         rows = self.make([['O.ARW']])
         pcs.apply_xmp(pcs.plan_xmp(rows)[0], self.dir)
         self.assertEqual(pcs._log_mappings([self.dir]), {})
+
+
+# ---------------------------------------------------------------- 人數、準確率評估、標註工具
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools'))
+import evaluate  # noqa: E402
+import label_tool  # noqa: E402
+
+
+class PeopleCountTests(FakeRows, unittest.TestCase):
+    def test_people_text(self):
+        self.assertEqual([pcs.people_text(n) for n in (0, 1, 4, 5, 12)], ['0人', '1人', '4人', '5人以上', '5人以上'])
+
+    def test_people_in_xmp_summary_and_report(self):
+        rows = pcs.batch_features(self.rows([dict(faces=3, files=['A.ARW'], source='A.ARW'), dict(faces=0), dict(faces=7)]))
+        self.assertIn('舞台色彩|人數|3人', pcs.xmp_fields(rows[0])['keywords'])
+        self.assertIn('舞台色彩|人數|5人以上', pcs.xmp_fields(rows[2])['keywords'])
+        self.assertTrue(pcs.xmp_summary(rows[0]).endswith('3人'))
+        lines, _ = pcs.build_report(rows)
+        self.assertIn('偵測到的人數：0人 1、3人 1、5人以上 1', lines)
+
+
+class EvaluateTests(unittest.TestCase):
+    def test_key_ignores_prefix_and_extension(self):
+        self.assertEqual(evaluate.key_of('8粉6藍_DSC02921.ARW'), 'dsc02921')
+        self.assertEqual(evaluate.key_of('S01紅_M01紅__DSC02921.jpg'), 'dsc02921')
+        self.assertEqual(evaluate.key_of('DSC02921.JPG'), 'dsc02921')
+
+    def test_halves_split_everything_once(self):
+        names = ['DSC%05d.ARW' % i for i in range(200)]
+        a = {n for n in names if evaluate.in_half(n, 'A')}
+        b = {n for n in names if evaluate.in_half(n, 'B')}
+        self.assertEqual(a | b, set(names))
+        self.assertFalse(a & b)
+        self.assertTrue(60 < len(a) < 140)  # 大致對半
+
+    def test_score(self):
+        labels = [{'檔名': 'A.ARW', '膚色': '粉', '整體': '藍', '人數': '2'},
+                  {'檔名': 'B.ARW', '膚色': '白', '整體': '藍', '人數': ''},
+                  {'檔名': 'C.ARW', '膚色': '', '整體': '紅', '人數': '5'},
+                  {'檔名': 'D.ARW', '膚色': '白', '整體': '白', '人數': '1'}]
+        preds = {'a': {'檔名': '8粉6藍_A.ARW', '膚色': '粉', '整體': '藍', '人數': 2},
+                 'b': {'檔名': 'B.ARW', '膚色': '藍', '整體': '藍', '人數': 1},
+                 'c': {'檔名': 'C.ARW', '膚色': '無', '整體': '紅', '人數': 8}}
+        s = evaluate.score(labels, preds)
+        self.assertEqual(s['n'], 3)
+        self.assertEqual(s['missing'], ['D.ARW'])
+        self.assertEqual(s['skin'], [1, 2])      # C 的膚色空白不計分
+        self.assertEqual(s['main'], [3, 3])
+        self.assertEqual(s['people'][:2], [2, 2])  # 標 5 = 5 人以上，程式 8 人算對
+        self.assertEqual(s['cm_skin'][('白', '藍')], 1)
+        self.assertEqual(s['wrong'][0][1], 'B.ARW')
+        text = evaluate.report(['x'], s, 'standard', None, '', '測試')
+        self.assertIn('| 膚色 | 50.0%（1/2） |', text)
+
+    def test_bad_label_value_rejected(self):
+        d = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(d, 'labels.csv'), 'w', encoding='utf-8-sig', newline='') as fp:
+                fp.write('檔名,膚色,整體\nA.ARW,藍色,藍\n')
+            with self.assertRaises(ValueError):
+                evaluate.read_labels(d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class LabelToolTests(unittest.TestCase):
+    def test_roundtrip_and_refuse_other_csv(self):
+        d = tempfile.mkdtemp()
+        try:
+            p = os.path.join(d, 'labels.csv')
+            label_tool.write_labels(p, {'A.ARW': {'檔名': 'A.ARW', '膚色': '粉', '整體': '藍', '人數': '2', '備註': ''}})
+            self.assertEqual(label_tool.read_labels(p)['A.ARW']['膚色'], '粉')
+            with open(p, 'w', encoding='utf-8') as fp:
+                fp.write('name,value\n1,2\n')
+            with self.assertRaises(ValueError):  # 不是標註檔，不能蓋掉
+                label_tool.read_labels(p)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_keys_match_filename_codes(self):
+        self.assertEqual(label_tool.KEY_COLORS['6'], '藍')
+        self.assertEqual(label_tool.KEY_COLORS['0'], '白')
+        self.assertEqual(label_tool.KEY_COLORS['8'], '粉')
+        self.assertNotIn('', label_tool.KEY_COLORS)
