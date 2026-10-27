@@ -8,12 +8,12 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
 功能：
   1. 偵測人臉，判斷「膚色被照成什麼顏色」（取臉部像素中佔最多數的色相）
   2. 判斷「整張照片的主要顏色」（忽略黑暗區域，以亮的有色光為主）
-  3. 輸出方式二選一：
+  3. 輸出方式三選一：
      改檔名：  DSC_1234.NEF  ->  6藍7紫_DSC_1234.NEF
                前 = 優先項目（預設膚色）、後 = 另一項，數字決定排序。
                匯入 Lightroom Classic 後用「檔案名稱」排序，就會依顏色排好。
      分資料夾：DSC_1234.NEF  ->  膚色6藍/整體7紫/DSC_1234.NEF
-     寫入 Lightroom 標籤：DSC_1234.NEF 旁邊的 DSC_1234.xmp 加上星等、代表張色標、「舞台色彩|…」關鍵字（不改檔名）
+     寫入 Lightroom 標籤：DSC_1234.NEF 旁邊的 DSC_1234.xmp 加上星等、色標（依人或依背景）、「舞台色彩|…」關鍵字（不改檔名）
 
   - RAW + JPG + XMP 同名檔會一起改名
   - 每次執行會在資料夾內留下紀錄 CSV，可一鍵復原
@@ -29,6 +29,7 @@ Required Notice: Copyright (c) 2026 ting2303 (https://github.com/ting2303/photo-
               [--performer] [--csv 結果.csv] [--time-seq] [--report [報告.txt]]
               [--stage standard|pale] [--scenes auto|manual|both --splits "2921,3040"]
   還原修圖後檔名：python photo_color_sorter.py <輸出資料夾> --restore [--log-folder 原始資料夾] [--apply]
+  復原上一次：  python photo_color_sorter.py <資料夾> --undo
 """
 import os
 import re
@@ -47,7 +48,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import cv2
 
-__version__ = '1.4.0'
+__version__ = '1.5.0'
 
 try:
     import rawpy
@@ -120,9 +121,10 @@ STAGE_PRESETS = {
 STAGE_NAMES = {'standard': '標準', 'pale': '淡色舞台'}
 
 
-# 挑圖功能開關（進階設定）。關掉的功能不顯示；人物分組關掉時連臉部特徵都不計算，分析較快
-FEATURES = ('rep', 'stars', 'person', 'bright', 'wb', 'timeline')
-FEATURE_NAMES = {'rep': '代表張', 'stars': '星等', 'person': '人物分組', 'bright': '亮度分組',
+# 挑圖功能開關（進階設定）。關掉的功能不顯示、不寫入。
+# 只偵測「有沒有人、有幾個人」，不辨認是不是同一個人（v1.5 起移除人物分組）
+FEATURES = ('rep', 'stars', 'bright', 'wb', 'timeline')
+FEATURE_NAMES = {'rep': '代表張', 'stars': '星等', 'bright': '亮度分組',
                  'wb': '調色起點', 'timeline': '燈光時間軸'}
 ALL_FEATURES = {k: True for k in FEATURES}
 SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.photo_color_sorter.json')
@@ -271,39 +273,16 @@ def analyze_overall(img, return_highlight=False, performer_boxes=None):
 APP_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))  # 打包成 exe 時的資料位置
 YUNET_MODEL = os.path.join(APP_DIR, 'face_detection_yunet_2023mar.onnx')
 YUNET_SHA256 = '8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4'
-SFACE_MODEL = os.path.join(APP_DIR, 'face_recognition_sface_2021dec_int8.onnx')  # 人物分組用（選配）
-SFACE_SHA256 = '2b0e941e6f16cc048c20aee0c8e31f569118f65d702914540f7bfdc14048d78a'
-SAME_PERSON_COS = 0.363  # SFace：兩張臉特徵的相似度超過此值視為同一人（OpenCV 官方建議值）
 FACE_SCORE = 0.7         # YuNet 人臉信心門檻，誤判多就調高、漏抓多就調低
 DETECT_SIDE = 1920        # 偵測用解析度，遠景小臉需要較高解析度
 
 _cascades = None
 _yunet = None
-_sface = None
 
 
 class Face(tuple):
-    """(x, y, w, h, 信心)，另外帶著 YuNet 的五官位置（raw），人物分組對齊臉部時使用"""
+    """(x, y, w, h, 信心)，另外帶著 YuNet 的五官位置（raw）"""
     raw = None
-
-
-def _get_sface():
-    """人臉辨識模型（只判斷兩張臉像不像，不辨識身分）；沒有模型檔或驗證失敗時回傳 False，人物分組就略過"""
-    global _sface
-    if _sface is None:
-        _sface = False
-        try:
-            if os.path.exists(SFACE_MODEL) and hasattr(cv2, 'FaceRecognizerSF'):
-                data = np.fromfile(SFACE_MODEL, np.uint8)
-                if hashlib.sha256(data.tobytes()).hexdigest() == SFACE_SHA256:
-                    _sface = cv2.FaceRecognizerSF.create('onnx', data, np.array([], np.uint8))
-        except Exception:
-            _sface = False
-    return _sface
-
-
-def sface_available():
-    return bool(_get_sface())
 
 
 def _get_cascades():
@@ -574,22 +553,6 @@ def _grad_energy(c, sigma):
     return float(np.mean(gx * gx + gy * gy)) * sigma * sigma
 
 
-def face_embedding(work, faces):
-    """最大那張臉的特徵向量（128 維，已正規化），用來判斷是不是同一人；沒有模型或沒有臉時回傳 None"""
-    rec = _get_sface()
-    if not rec or not faces:
-        return None
-    f = max(faces, key=lambda x: x[2] * x[3])
-    if getattr(f, 'raw', None) is None:
-        return None  # Haar 偵測沒有五官位置，無法對齊
-    try:
-        emb = rec.feature(rec.alignCrop(work, f.raw)).flatten().astype(np.float32)
-        n = float(np.linalg.norm(emb))
-        return (emb / n).tolist() if n > 0 else None
-    except Exception:
-        return None
-
-
 def face_lab(work, faces):
     """最大那張臉中央的 Lab 色度 (a, b)：a 正 = 偏洋紅、負 = 偏綠；b 正 = 偏黃、負 = 偏藍"""
     if not faces:
@@ -630,7 +593,7 @@ def photo_metrics(work, faces):
     return float(sharp), face_px, face_bright
 
 
-def analyze_group(group, stage='standard', person=True):
+def analyze_group(group, stage='standard'):
     apply_stage_preset(stage)
     path = os.path.join(group['dir'], group['source'])
     try:
@@ -647,13 +610,12 @@ def analyze_group(group, stage='standard', person=True):
         else:
             main_p, main_p_ratio, top_p = main, main_ratio, top
         sharp, face_px, face_bright = photo_metrics(work, faces)
-        emb = face_embedding(work, faces) if person else None
         ab = face_lab(work, faces)
         t, t_src = group_capture_time(group)
         return dict(group, skin=skin, skin_ratio=skin_ratio, faces=nfaces,
                     main=main, main_ratio=main_ratio, top=top, highlight=highlight,
                     main_perf=main_p, main_perf_ratio=main_p_ratio, top_perf=top_p,
-                    sharp=sharp, face_px=face_px, face_bright=face_bright, face_emb=emb, face_ab=ab,
+                    sharp=sharp, face_px=face_px, face_bright=face_bright, face_ab=ab,
                     time=t, time_src=t_src, stage=stage, error=None)
     except Exception as e:
         return dict(group, error=friendly_error(e))
@@ -789,36 +751,10 @@ def batch_features(results, mode='both', order='skin', performer=False, scene_mo
             expo = 1 - min(abs(r['face_bright'] - 0.55) / 0.55, 1) if r['face_bright'] is not None else 0.5
             return 0.5 * r['sharp_score'] / 100 + 0.25 * r['face_px'] / big + 0.25 * expo
         max(with_face, key=score)['rep'] = True
-    _assign_persons(out)
     _assign_brightness(out)
     _assign_stars(out)
     _assign_wb(out)
     return out + bad
-
-
-def _assign_persons(rows):
-    """人物分組：依拍攝時間逐張比對每一組的平均臉部特徵，相似度夠高就歸同一人，否則開新的一組。
-    組別依照片數多到少命名 P1、P2…；沒有臉或沒有模型時為 None。"""
-    centers, members = [], []
-    for i, r in enumerate(rows):
-        e = r.get('face_emb')
-        r['person'] = None
-        if e is None:
-            continue
-        e = np.asarray(e, np.float32)
-        if centers:
-            sims = np.array([float(c @ e) / max(float(np.linalg.norm(c)), 1e-9) for c in centers])
-            k = int(sims.argmax())
-            if sims[k] >= SAME_PERSON_COS:
-                centers[k] = centers[k] + e
-                members[k].append(i)
-                continue
-        centers.append(e.copy())
-        members.append([i])
-    order = sorted(range(len(members)), key=lambda k: (-len(members[k]), members[k][0]))
-    for rank, k in enumerate(order, 1):
-        for i in members[k]:
-            rows[i]['person'] = 'P%d' % rank
 
 
 def _linear(v):
@@ -826,22 +762,14 @@ def _linear(v):
 
 
 def _assign_brightness(rows):
-    """亮度分組（亮／中／暗）：和同一個人最亮的幾張比（沒有人物分組時和整批比），
+    """亮度分組（亮／中／暗）：臉的亮度和整批最亮的幾張（第 90 百分位）比，
     差 0.5 級以內為亮、1.5 級以內為中、更暗為暗。舞台上同一首歌追光忽亮忽暗時，可以分開同步。"""
-    def ref_of(vals):
-        return float(np.percentile(vals, 90)) if vals else None
     lin = {i: _linear(r['face_bright']) for i, r in enumerate(rows) if r.get('face_bright') is not None}
-    all_ref = ref_of(list(lin.values()))
-    by_person = {}
-    for i, r in enumerate(rows):
-        if i in lin and r.get('person'):
-            by_person.setdefault(r['person'], []).append(lin[i])
-    refs = {p: ref_of(v) for p, v in by_person.items() if len(v) >= 3}
+    ref = float(np.percentile(list(lin.values()), 90)) if lin else None
     for i, r in enumerate(rows):
         r['bright'], r['ev'] = None, None
-        if i not in lin or not all_ref:
+        if i not in lin or not ref:
             continue
-        ref = refs.get(r.get('person'), all_ref)
         ev = float(np.log2(max(lin[i], 1e-6) / max(ref, 1e-6)))
         r['ev'] = ev
         r['bright'] = '亮' if ev >= BRIGHT_EV[0] else '中' if ev >= BRIGHT_EV[1] else '暗'
@@ -881,21 +809,14 @@ def _assign_stars(rows):
 
 
 def _assign_wb(rows):
-    """調色起點建議：臉的顏色和「同一個人在自然光下的膚色」比，偏了多少、往哪個方向。
+    """調色起點建議：臉的顏色和「整批在自然光下的膚色」（中位數）比，偏了多少、往哪個方向。
     只給方向與相對強度（Lab 色度差），不寫入檔案；數值不是 Lightroom 滑桿的精確值。
     色溫為負 = 往冷（藍）調，正 = 往暖（黃）調；色調為負 = 往綠調，正 = 往洋紅調。"""
     natural = [r for r in rows if r.get('face_ab') and r['skin'] == WHITE]
-    def med_ab(rs):
-        return (float(np.median([r['face_ab'][0] for r in rs])), float(np.median([r['face_ab'][1] for r in rs]))) if rs else None
-    all_ref = med_ab(natural)
-    by_person = {}
-    for r in natural:
-        if r.get('person'):
-            by_person.setdefault(r['person'], []).append(r)
-    refs = {p: med_ab(v) for p, v in by_person.items() if len(v) >= 2}
+    ref = ((float(np.median([r['face_ab'][0] for r in natural])), float(np.median([r['face_ab'][1] for r in natural])))
+           if natural else None)
     for r in rows:
         r['wb_temp'] = r['wb_tint'] = r['wb_shift'] = None
-        ref = refs.get(r.get('person'), all_ref)
         if not r.get('face_ab') or ref is None:
             continue
         if float(np.hypot(*r['face_ab'])) < GRAY_FACE_CHROMA:
@@ -977,15 +898,7 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
     lines.append('拍攝時間：%d 張讀到 EXIF（%.0f%%）' % (exif, pct(exif)))
     scenes = len({r['scene'] for r in ok})
     lines.append('燈光段落：%d 段，每段平均 %.1f 張' % (scenes, n / max(scenes, 1)))
-    persons = {r['person'] for r in ok if r.get('person')}
     with_face = [r for r in ok if r['faces']]
-    person_on = on['person'] and sface_available()
-    if not on['person']:
-        pass
-    elif not sface_available():
-        lines.append('人物分組：沒有人臉辨識模型，已略過')
-    else:
-        lines.append('人物分組：%d 組（%d 張有臉）' % (len(persons), len(with_face)))
     stars = {s: sum(r['stars'] == s for r in ok) for s in (3, 2, 1)}
     if on['stars']:
         lines.append('自動評分：3 星 %d、2 星 %d、1 星 %d' % (stars[3], stars[2], stars[1]))
@@ -1031,7 +944,7 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
         else:
             notes.append('⚠ %.0f%% 的照片主色票數偏低（?）：畫面顏色很雜，背景 LED 螢幕很花時可以勾「整體偏重演出者」' % pct(unc))
     if n >= 5 and pct(noface) >= 50:
-        notes.append('⚠ %.0f%% 的照片沒偵測到臉：膚色、人物分組、亮度與評分會較少，建議以「只看整體」分類' % pct(noface))
+        notes.append('⚠ %.0f%% 的照片沒偵測到臉：膚色、亮度與評分會較少，建議以「只看整體」分類' % pct(noface))
     future = [r for r in ok if r['time'] > datetime.datetime.now() + datetime.timedelta(days=1)]
     if future:
         notes.append('ℹ %d 張的拍攝時間在未來（例如 %s，%s）：相機時間可能設錯，排序、段落與時間軸會不準'
@@ -1040,15 +953,6 @@ def build_report(rows, mode='both', order='skin', performer=False, features=None
         notes.append('ℹ 沒有讀到任何拍攝時間（可能是截圖、轉存或社群下載的照片），段落與時間序號改用檔案時間，順序可能不準')
     elif exif < n:
         notes.append('ℹ %d 張沒有拍攝時間，改用檔案時間（表格時間後面有 *）' % (n - exif))
-    if person_on and len(with_face) >= 10:
-        size = {}
-        for r in ok:
-            if r.get('person'):
-                size[r['person']] = size.get(r['person'], 0) + 1
-        small = [k for k, v in size.items() if v <= 2]
-        if len(small) >= 2:
-            notes.append('ℹ 人物分組有 %d 組只有 1～2 張，可能是同一人被拆開（濃妝、側臉、臉太小或模糊），可以用「表格排序：人物」人工確認'
-                         % len(small))
     blur1 = sum(r['stars'] == 1 and r.get('star_why') == '可能模糊' for r in ok)
     if on['stars'] and n >= 10 and blur1 >= 0.3 * n:
         notes.append('ℹ %d 張被評為可能模糊（%.0f%%）：如果現場本來就很暗或有大量動態，可以改看清晰度數字挑選' % (blur1, pct(blur1)))
@@ -1074,26 +978,27 @@ def _cell(s):
     return "'" + s if s[:1] in ('=', '+', '-', '@') else s
 
 
-def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False, features=None):
+def export_csv(rows, path, mode='both', order='skin', digits=True, output='rename', time_seq=False, features=None,
+               label_mode='skin'):
     """把分析結果（含挑圖資訊）存成 CSV，可用 Excel 開啟；關掉的挑圖功能欄位留空"""
     on = dict(ALL_FEATURES, **(features or {}))
     with open(path, 'w', newline='', encoding='utf-8-sig') as fp:
         wr = csv.writer(fp)
-        wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '人物', '亮度',
+        wr.writerow(['檔名', '拍攝時間', '時間來源', '燈光段落', '代表張', '清晰度', '星等', '評分說明', '亮度',
                      '調色起點建議', '人數', '膚色', '膚色比例', '整體', '整體比例', '整體組成', '燈光爆點', '不確定',
                      '結果', '錯誤'])
         for r in rows:
             if r.get('error'):
-                wr.writerow([_cell(r['source'])] + [''] * 19 + [r['error']])
+                wr.writerow([_cell(r['source'])] + [''] * 18 + [r['error']])
                 continue
             clean = strip_prefix(r['source'])
-            new = (xmp_summary(r, on) if output == 'xmp'
+            new = (xmp_summary(r, on, label_mode) if output == 'xmp'
                    else os.path.join(build_subdir(r, mode, order, digits), clean) if output == 'folder'
                    else build_prefix(r, mode, order, digits, time_seq) + clean)
             wr.writerow([_cell(r['source']), r['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3], r['time_src'],
                          'S%02d' % r['scene'], '★' if r['rep'] and on['rep'] else '', r['sharp_score'],
                          r.get('stars', '') if on['stars'] else '', r.get('star_why', '') if on['stars'] else '',
-                         (r.get('person') or '') if on['person'] else '', (r.get('bright') or '') if on['bright'] else '',
+                         (r.get('bright') or '') if on['bright'] else '',
                          wb_text(r) if on['wb'] else '', r['faces'],
                          label(r['skin']), '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                          label(r['main']), '%d%%' % (r['main_ratio'] * 100),
@@ -1330,9 +1235,16 @@ def plan_restore(folder, log_folders=(), recursive=False):
 # ---------------------------------------------------------------- 寫入 Lightroom 標籤（XMP）
 
 XMP_ROOT = '舞台色彩'      # 關鍵字都放在這個上層之下，在 Lightroom 可以整組刪掉
-REP_LABEL = 'Red'          # 代表張的色標（Lightroom 預設色標組的英文名稱）
+# Lightroom 只有 5 種色標。檔案裡存的是色標「名稱」，要和 Lightroom 目前色標組的名稱一樣才會顯示顏色
+# （中文版或自訂色標組的名稱不同時會變白色，所以名稱可以在進階設定修改）
+LR_LABELS = ('Red', 'Yellow', 'Green', 'Blue', 'Purple')
+LR_LABEL_ZH = ('紅標', '黃標', '綠標', '藍標', '紫標')
+# 11 種顏色對到 5 種色標：橙併入黃、青併入綠、粉併入紫；白、暗、無不加色標
+COLOR_TO_LABEL = {0: 0, 1: 1, 2: 1, 3: 2, 4: 2, 5: 3, 6: 4, 7: 4}
+LABEL_MODES = {'skin': '依人（膚色）', 'main': '依背景（整體）', 'rep': '只標代表張（紅標）', 'none': '不寫色標'}
+REP_LABEL = LR_LABELS[0]
 XMP_SKIP_EXTS = IMG_EXTS | {'.dng'}  # Lightroom 不讀這些格式旁邊的 .xmp（要寫進照片本身），本工具不寫
-XMP_SKIP_REASON = 'Lightroom 不讀 JPG、PNG、TIFF、DNG 旁邊的 .xmp，要改照片檔案本身才行；為了不動到照片，這些格式不寫入，請改用「改檔名」'
+XMP_SKIP_REASON = 'Lightroom 不讀 JPG、PNG、TIFF、BMP、WebP、DNG 旁邊的 .xmp，要改照片檔案本身才行；為了不動到照片，這些格式不寫入，請改用「改檔名」'
 _NS = {'x': 'adobe:ns:meta/', 'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
        'xmp': 'http://ns.adobe.com/xap/1.0/', 'dc': 'http://purl.org/dc/elements/1.1/',
        'lr': 'http://ns.adobe.com/lightroom/1.0/'}
@@ -1344,18 +1256,36 @@ _NEW_XMP = ('<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Photo Color Sorter">\n
             '</x:xmpmeta>\n')
 
 
-def xmp_fields(r, features=None):
-    """一張照片要寫進 XMP 的內容：{'rating': 1~3 或 None, 'label': 色標或 None, 'keywords': [階層關鍵字]}。
-    關掉的挑圖功能不寫。顏色與段落一律寫（它們是分類本身，不是挑圖功能）"""
+def label_index(r, label_mode='skin', features=None):
+    """這張要用第幾個色標（0~4 對應 LR_LABELS），不加色標時回傳 None"""
+    on = dict(ALL_FEATURES, **(features or {}))
+    if label_mode in ('skin', 'main'):
+        return COLOR_TO_LABEL.get(r[label_mode])
+    if label_mode == 'rep' and on['rep'] and r.get('rep'):
+        return 0
+    return None
+
+
+def clean_label_names(names):
+    """使用者填的色標名稱；空白或數量不對時用英文預設"""
+    names = [str(n).strip() for n in (names or [])]
+    return tuple(n or d for n, d in zip(names, LR_LABELS)) if len(names) == len(LR_LABELS) else LR_LABELS
+
+
+def xmp_fields(r, features=None, label_mode='skin', label_names=None):
+    """一張照片要寫進 XMP 的內容：{'rating': 1~3 或 None, 'label': 色標名稱或 None, 'keywords': [階層關鍵字]}。
+    label_mode：'skin' 依膚色、'main' 依整體主色、'rep' 只標代表張、'none' 不寫色標。
+    關掉的挑圖功能不寫。顏色、段落、人數一律寫（它們是分類本身，不是挑圖功能）"""
     on = dict(ALL_FEATURES, **(features or {}))
     kw = ['%s|膚色|%s' % (XMP_ROOT, label(r['skin'])), '%s|整體|%s' % (XMP_ROOT, label(r['main'])),
           '%s|段落|S%02d' % (XMP_ROOT, r['scene']), '%s|人數|%s' % (XMP_ROOT, people_text(r['faces']))]
-    if on['person'] and r.get('person'):
-        kw.append('%s|人物|%s' % (XMP_ROOT, r['person']))
     if on['bright'] and r.get('bright'):
         kw.append('%s|亮度|%s' % (XMP_ROOT, r['bright']))
+    if on['rep'] and r.get('rep'):
+        kw.append('%s|代表張' % XMP_ROOT)
+    i = label_index(r, label_mode, features)
     return {'rating': r.get('stars') if on['stars'] else None,
-            'label': REP_LABEL if on['rep'] and r.get('rep') else None, 'keywords': kw}
+            'label': clean_label_names(label_names)[i] if i is not None else None, 'keywords': kw}
 
 
 def xmp_target(r):
@@ -1370,21 +1300,25 @@ def xmp_target(r):
     return os.path.join(r['dir'], stem + '.xmp')
 
 
-def xmp_summary(r, features=None):
-    """表格「結果」欄的摘要，例如「★★ 紅標 粉/藍 S03」"""
+def xmp_summary(r, features=None, label_mode='skin'):
+    """表格「結果」欄的摘要，例如「★★ 藍標 粉/藍 S03 2人 代表」"""
     if xmp_target(r) is None:
         return '（%s 不寫入）' % os.path.splitext(r['source'])[1].lstrip('.').upper()
-    f = xmp_fields(r, features)
+    on = dict(ALL_FEATURES, **(features or {}))
+    f = xmp_fields(r, features, label_mode)
     parts = ['★' * f['rating']] if f['rating'] else []
-    if f['label']:
-        parts.append('紅標')
+    i = label_index(r, label_mode, features)
+    if i is not None:
+        parts.append(LR_LABEL_ZH[i])
     parts.append('%s/%s' % (label(r['skin']), label(r['main'])))
     parts.append('S%02d' % r['scene'])
     parts.append(people_text(r['faces']))
+    if on['rep'] and r.get('rep'):
+        parts.append('代表')
     return ' '.join(parts)
 
 
-def plan_xmp(rows, features=None):
+def plan_xmp(rows, features=None, label_mode='skin', label_names=None):
     """回傳 (計畫 [{'xmp', 'fields', 'source'}], 不寫入 [(檔名, 原因)])"""
     plan, skipped = [], []
     for r in rows:
@@ -1394,7 +1328,7 @@ def plan_xmp(rows, features=None):
         if path is None:
             skipped.append((r['source'], XMP_SKIP_REASON))
         else:
-            plan.append({'xmp': path, 'fields': xmp_fields(r, features), 'source': r['source']})
+            plan.append({'xmp': path, 'fields': xmp_fields(r, features, label_mode, label_names), 'source': r['source']})
     return plan, skipped
 
 
@@ -1703,11 +1637,11 @@ def _undo_xmp(rows, log_path):
     return done, errors
 
 
-def run_analysis(groups, progress=None, workers=None, stage='standard', person=True):
+def run_analysis(groups, progress=None, workers=None, stage='standard'):
     workers = workers or max(1, (os.cpu_count() or 2) - 1)
     results = []
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(analyze_group, g, stage, person) for g in groups]
+        futs = [ex.submit(analyze_group, g, stage) for g in groups]
         for i, f in enumerate(as_completed(futs), 1):
             results.append(f.result())
             if progress:
@@ -1748,17 +1682,19 @@ def run_gui(initial_folder=None):
     adv_open = tk.BooleanVar(value=False)
     group_scene = tk.BooleanVar(value=True)
     feat = {k: tk.BooleanVar(value=True) for k in FEATURES}
+    label_mode = tk.StringVar(value='skin')
+    label_names = [tk.StringVar(value=n) for n in LR_LABELS]
     status = tk.StringVar(value='請選擇照片資料夾，再按「① 分析」')
-    state = {'results': [], 'busy': False, 'person_done': True, 'swatch': {}, 'tl': None}
+    state = {'results': [], 'busy': False, 'swatch': {}, 'tl': None}
     q = queue.Queue()
 
     # 記住上次的設定（存在使用者資料夾的 .photo_color_sorter.json）
     saved = load_settings()
     allowed = {'output': ('rename', 'folder', 'xmp'), 'mode': ('both', 'skin', 'main'), 'order': ('skin', 'main'),
-               'sort_by': ('time', 'name', 'color', 'person', 'stars'), 'stage': tuple(STAGE_PRESETS),
-               'scene_mode': ('auto', 'manual', 'both')}
+               'sort_by': ('time', 'name', 'color', 'people', 'stars'), 'stage': tuple(STAGE_PRESETS),
+               'scene_mode': ('auto', 'manual', 'both'), 'label_mode': tuple(LABEL_MODES)}
     for var, k in ((output, 'output'), (mode, 'mode'), (order, 'order'), (sort_by, 'sort_by'),
-                   (stage, 'stage'), (scene_mode, 'scene_mode')):
+                   (stage, 'stage'), (scene_mode, 'scene_mode'), (label_mode, 'label_mode')):
         if saved.get(k) in allowed[k]:  # 設定檔被改壞時忽略，不讓程式當掉
             var.set(saved[k])
     for var, k in ((digits, 'digits'), (performer, 'performer'), (time_seq, 'time_seq'), (show_all, 'show_all'),
@@ -1769,6 +1705,12 @@ def run_gui(initial_folder=None):
     for k, v in (feats.items() if isinstance(feats, dict) else ()):
         if k in feat and isinstance(v, bool):
             feat[k].set(v)
+    if isinstance(saved.get('label_names'), list):
+        for var, n in zip(label_names, clean_label_names(saved['label_names'])):
+            var.set(n)
+
+    def label_names_now():
+        return clean_label_names([v.get() for v in label_names])
 
     def features_now():
         return {k: v.get() for k, v in feat.items()}
@@ -1777,7 +1719,8 @@ def run_gui(initial_folder=None):
         save_settings({'output': output.get(), 'mode': mode.get(), 'order': order.get(), 'sort_by': sort_by.get(),
                        'stage': stage.get(), 'scene_mode': scene_mode.get(), 'digits': digits.get(),
                        'performer': performer.get(), 'time_seq': time_seq.get(), 'show_all': show_all.get(),
-                       'adv_open': adv_open.get(), 'group_scene': group_scene.get(), 'features': features_now()})
+                       'adv_open': adv_open.get(), 'group_scene': group_scene.get(), 'features': features_now(),
+                       'label_mode': label_mode.get(), 'label_names': list(label_names_now())})
 
     def on_option():
         # 關掉的功能不能拿來排序（看不到欄位卻照它排會很混亂），改回照拍攝時間
@@ -1792,14 +1735,13 @@ def run_gui(initial_folder=None):
         b_apply.configure(text={'folder': '② 執行分資料夾', 'xmp': '② 寫入標籤'}.get(output.get(), '② 執行改名'))
         m_tools.entryconfig(STRIP_LABEL, state='disabled' if is_folder or state['busy'] else 'normal')
         c_seq.state(['disabled'] if output.get() != 'rename' else ['!disabled'])
+        for w in label_widgets:  # 色標設定只有「寫入 Lightroom 標籤」用得到
+            w.state(['!disabled'] if output.get() == 'xmp' else ['disabled'])
         if output.get() == 'xmp' and not state['busy']:
             status.set('寫入 Lightroom 標籤：只寫 RAW 檔旁邊的 .xmp，不改檔名。JPG、PNG、TIFF、DNG 不寫入'
                        '（Lightroom 不讀它們旁邊的 .xmp，要改照片本身才行）')
 
     def on_feature(k):
-        if (k == 'person' and feat['person'].get() and state['results'] and not state['person_done']
-                and not state['busy'] and messagebox.askyesno('重新分析', '打開「人物分組」需要重新分析才會有結果，要現在開始嗎？')):
-            start_analysis()
         on_option()
 
     def on_stage():
@@ -1875,7 +1817,7 @@ def run_gui(initial_folder=None):
         ttk.Radiobutton(a2, text=STAGE_NAMES[v], value=v, variable=stage, command=on_stage).pack(side='left')
     ttk.Label(a2, text='　表格排序：').pack(side='left')
     sort_radios = {}
-    for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人物', 'person'), ('星等', 'stars')):
+    for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人數', 'people'), ('星等', 'stars')):
         rb = ttk.Radiobutton(a2, text=t, value=v, variable=sort_by, command=on_option)
         rb.pack(side='left')
         if v in feat:
@@ -1899,7 +1841,23 @@ def run_gui(initial_folder=None):
     for k in FEATURES:
         ttk.Checkbutton(a4, text=FEATURE_NAMES[k], variable=feat[k],
                         command=lambda k=k: on_feature(k)).pack(side='left', padx=(0, 8))
-    ttk.Label(a4, text='（不需要的可以關掉；關掉人物分組分析會快很多）', foreground='#777').pack(side='left')
+    ttk.Label(a4, text='（不需要的可以關掉）', foreground='#777').pack(side='left')
+    # Lightroom 色標：在 Lightroom 過濾器點色標就能依燈光顏色篩選
+    a5 = ttk.Frame(adv)
+    a5.pack(fill='x', pady=(4, 0))
+    ttk.Label(a5, text='Lightroom 色標：').pack(side='left')
+    label_widgets = []
+    for v, t in LABEL_MODES.items():
+        rb = ttk.Radiobutton(a5, text=t, value=v, variable=label_mode, command=on_option)
+        rb.pack(side='left')
+        label_widgets.append(rb)
+    ttk.Label(a5, text='　色標名稱：').pack(side='left')
+    for var in label_names:
+        e = ttk.Entry(a5, textvariable=var, width=7)
+        e.pack(side='left', padx=1)
+        e.bind('<FocusOut>', lambda ev: on_option())
+        label_widgets.append(e)
+    ttk.Label(a5, text='（LR 顯示白色時改成 LR 色標組的名稱）', foreground='#777').pack(side='left', padx=4)
 
     # 圖例：用色塊代替文字
     legend = ttk.Frame(root, padding=(8, 4))
@@ -1930,18 +1888,18 @@ def run_gui(initial_folder=None):
                             '每列左邊的小方塊：左半是膚色、右半是整體主色\n'
                             '燈光時間軸（表格上方）：點一下就跳到那一段\n'
                             '星等：整批相對初篩（1 星 = 沒有臉、太暗或可能模糊）\n'
-                            '人物：同一人歸同一組（P1 照片最多），只比對臉像不像，不辨識是誰\n\n'
+                            '人數：偵測到幾張臉（遠處太小、背對、太暗的臉不會算進去）。只判斷有沒有人、有幾個，不辨認是誰\n\n'
                             '「顯示 → 顯示所有欄位」還有：\n'
                             '清晰度：整批相對分數 0~100\n'
-                            '亮度：和同一人最亮的照片比\n'
+                            '亮度：臉的亮度和整批最亮的照片比\n'
                             '調色起點：臉的色偏方向（色溫＋往暖、色調＋往洋紅），只是建議，不會寫入檔案\n'
                             '整體後的 ?：主色票數偏低，建議人工確認\n'
                             '燈光爆點：很亮又沒顏色的部分佔亮處的比例（爆點少時不參與判斷顏色）\n'
                             '時間後的 *：沒有拍攝時間，改用檔案時間\n\n'
-                            '開啟照片：點「原檔名」，或在任一列按兩下／按 Enter；按右鍵可以在檔案總管中顯示\n'
-                            '人數：偵測到幾張臉（遠處太小、背對、太暗的臉不會算進去）\n\n'
-                            '寫入 Lightroom 標籤（進階設定 → 輸出方式）：把星等、代表張紅色標、'
-                            '顏色／段落／人物／亮度關鍵字（在「舞台色彩」底下）寫進 RAW 旁邊的 .xmp，不改檔名。'
+                            '開啟照片：點「原檔名」，或在任一列按兩下／按 Enter；按右鍵可以在檔案總管中顯示\n\n'
+                            '寫入 Lightroom 標籤（進階設定 → 輸出方式）：把星等、色標、'
+                            '顏色／段落／人數／亮度／代表張關鍵字（在「舞台色彩」底下）寫進 RAW 旁邊的 .xmp，不改檔名。'
+                            '色標可以選「依人」或「依背景」的顏色，在 Lightroom 的過濾器點色標就能篩選。'
                             '已有的星等和色標會保留。JPG、PNG、TIFF、DNG 不寫入')
 
     btns = ttk.Frame(root, padding=8)
@@ -1956,13 +1914,13 @@ def run_gui(initial_folder=None):
     pbar.pack(side='right')
 
     # --- 預覽表格：預設只顯示挑圖最常用的欄位
-    cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'person', 'bright', 'wb', 'faces', 'skin', 'skin_r',
+    cols = ('file', 'time', 'scene', 'rep', 'stars', 'sharp', 'bright', 'wb', 'faces', 'skin', 'skin_r',
             'main', 'main_r', 'top', 'hl', 'new')
-    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '人物', '亮度', '調色起點', '人數', '膚色', '膚色比例',
+    heads = ('原檔名', '拍攝時間', '段落', '代表', '星等', '清晰度', '亮度', '調色起點', '人數', '膚色', '膚色比例',
              '整體', '整體比例', '整體組成', '燈光爆點', '結果')
-    widths = (170, 90, 45, 40, 50, 55, 45, 40, 120, 45, 45, 65, 50, 65, 160, 65, 300)
-    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'person', 'faces', 'skin', 'main', 'new')
-    feat_cols = {'rep': 'rep', 'stars': 'stars', 'person': 'person', 'bright': 'bright', 'wb': 'wb'}
+    widths = (170, 90, 45, 40, 50, 55, 40, 120, 45, 45, 65, 50, 65, 160, 65, 300)
+    basic_cols = ('file', 'time', 'scene', 'rep', 'stars', 'faces', 'skin', 'main', 'new')
+    feat_cols = {'rep': 'rep', 'stars': 'stars', 'bright': 'bright', 'wb': 'wb'}
 
     # 燈光時間軸色帶：整場的整體主色與膚色，點一下跳到那一段
     tl_frame = ttk.Frame(root, padding=(8, 0, 8, 4))
@@ -2080,9 +2038,8 @@ def run_gui(initial_folder=None):
         sk = slot_order(mode.get(), order.get())
         if sort_by.get() == 'name':
             rows.sort(key=lambda r: (r['dir'], r['stem']))
-        elif sort_by.get() == 'person':
-            rows.sort(key=lambda r: (1, '', r['source']) if r.get('error') else
-                      (0 if r.get('person') else 1, int((r.get('person') or 'P0')[1:]), r['time']))
+        elif sort_by.get() == 'people':  # 人多的在前
+            rows.sort(key=lambda r: (1, 0, r['source']) if r.get('error') else (0, -r['faces'], r['time']))
         elif sort_by.get() == 'stars':
             rows.sort(key=lambda r: (1, 0, r['source']) if r.get('error') else (0, -r['stars'], r['time']))
         elif sort_by.get() == 'color':
@@ -2117,13 +2074,13 @@ def run_gui(initial_folder=None):
                                          values=[vals[c] for c in cols], tags=('scenehdr',))
         for r in rows:
             if r.get('error'):
-                iid = tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
+                iid = tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 8 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
                                   tags=('err',))
                 state['paths'][iid] = os.path.join(r['dir'], r['source'])
                 continue
             clean = strip_prefix(r['source'])
             if output.get() == 'xmp':
-                new = xmp_summary(r, f)
+                new = xmp_summary(r, f, label_mode.get())
             elif output.get() == 'folder':
                 new = os.path.join(build_subdir(r, mode.get(), order.get(), digits.get()), clean)
             else:
@@ -2137,7 +2094,7 @@ def run_gui(initial_folder=None):
                         image=swatch(r['skin'], r['main']), values=(
                 r['source'], t, 'S%02d' % r['scene'], '★' if r['rep'] and f['rep'] else '',
                 '★' * r['stars'] if f['stars'] else '', r['sharp_score'],
-                (r.get('person') or '') if f['person'] else '', (r.get('bright') or '') if f['bright'] else '',
+                (r.get('bright') or '') if f['bright'] else '',
                 wb_text(r) if f['wb'] else '', r['faces'], label(r['skin']),
                 '%d%%' % (r['skin_ratio'] * 100) if r['skin'] != NOFACE else '',
                 label(r['main']) + ('?' if r['uncertain'] else ''), '%d%%' % (r['main_ratio'] * 100), top3,
@@ -2215,14 +2172,11 @@ def run_gui(initial_folder=None):
         pbar['value'] = 0
         status.set('分析中… 共 %d 張%s' % (len(groups), '（淡色舞台設定）' if stage.get() == 'pale' else ''))
 
-        person_on = feat['person'].get()
-        state['person_done'] = person_on
         state['folder'] = os.path.abspath(f)
 
         def worker():
             try:
-                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)), stage=stage.get(),
-                                   person=person_on)
+                res = run_analysis(groups, progress=lambda i, n: q.put(('progress', i, n)), stage=stage.get())
                 q.put(('done', res))
             except Exception as e:
                 q.put(('fail', str(e)))
@@ -2289,17 +2243,20 @@ def run_gui(initial_folder=None):
 
     def do_write_xmp(f):
         rows, _ = current_rows()
-        plan, skipped = plan_xmp(rows, features_now())
+        plan, skipped = plan_xmp(rows, features_now(), label_mode.get(), label_names_now())
         if not plan:
             messagebox.showinfo('沒有可以寫入的照片', '這個資料夾沒有 RAW 檔，所以沒有可以寫入的標籤。\n\n'
                                 + XMP_SKIP_REASON + '。')
             return
-        msg = '即將寫入 %d 張 RAW 照片的 Lightroom 標籤（星等、代表張色標、關鍵字）。' % len(plan)
+        msg = '即將寫入 %d 張 RAW 照片的 Lightroom 標籤（星等、色標、關鍵字）。\n色標：%s' % (
+            len(plan), LABEL_MODES[label_mode.get()])
+        if label_mode.get() in ('skin', 'main'):
+            msg += '（橙併入黃、青併入綠、粉併入紫；白、暗、沒有臉不加色標）'
         if skipped:
             msg += '\n另外 %d 張是 JPG／PNG／TIFF／DNG，不會寫入。' % len(skipped)
         msg += ('\n\n・照片已經有星等或色標時，保留原本的，只補空的。'
-                '\n・照片已經匯入 Lightroom 的話，寫入後要在 Lightroom 選取這些照片，'
-                '按「中繼資料 → 從檔案讀取中繼資料」才會更新。'
+                '\n・照片已經匯入 Lightroom 的話：寫入前先在 Lightroom 選取這些照片按「中繼資料 → 將中繼資料儲存至檔案」（Ctrl+S），'
+                '寫入後再按「中繼資料 → 從檔案讀取中繼資料」。少了前一步，Lightroom 裡還沒存檔的修圖會被蓋掉。'
                 '\n・如果 Lightroom 開著「自動將變更寫入 XMP」，它可能會蓋掉本工具寫的內容。'
                 '\n\n要繼續嗎？')
         if not messagebox.askyesno('確認', msg):
@@ -2359,7 +2316,8 @@ def run_gui(initial_folder=None):
             path = os.path.join(f, '_色彩分析_%s_%d.csv' % (stamp, k))
         try:
             rows, _ = current_rows()
-            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get(), time_seq.get(), features_now())
+            export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get(), time_seq.get(), features_now(),
+                       label_mode.get())
         except Exception as e:
             messagebox.showerror('無法匯出', str(e))
             return
@@ -2521,6 +2479,10 @@ def run_cli(argv):
     ap.add_argument('--apply', action='store_true', help='實際執行（不加只預覽）')
     ap.add_argument('--output', choices=['rename', 'folder', 'xmp'], default='rename',
                     help='改檔名、分資料夾，或寫入 Lightroom 標籤（RAW 旁邊的 .xmp）')
+    ap.add_argument('--label', choices=list(LABEL_MODES), default='skin',
+                    help='搭配 --output xmp：色標 skin 依人（膚色）、main 依背景（整體）、rep 只標代表張、none 不寫')
+    ap.add_argument('--label-names', default=','.join(LR_LABELS), metavar='紅,黃,綠,藍,紫',
+                    help='色標名稱，要和 Lightroom 的色標組一致（預設 %s）' % ','.join(LR_LABELS))
     ap.add_argument('--mode', choices=['both', 'skin', 'main'], default='both')
     ap.add_argument('--order', choices=['skin', 'main'], default='skin')
     ap.add_argument('--no-digits', action='store_true', help='不加排序數字')
@@ -2535,6 +2497,7 @@ def run_cli(argv):
     ap.add_argument('--splits', default='', metavar='號碼', help='從這些檔名號碼開始新段落，例如 "2921,3040,3074"')
     ap.add_argument('--report', nargs='?', const='-', metavar='PATH',
                     help='印出分析報告；給檔名則另外存成文字檔')
+    ap.add_argument('--undo', action='store_true', help='復原這個資料夾最近一次的改名、分資料夾或寫入 Lightroom 標籤')
     ap.add_argument('--restore', action='store_true', help='還原修圖輸出後的檔名（移除本工具加的前綴）')
     ap.add_argument('--log-folder', action='append', default=[], metavar='DIR',
                     help='搭配 --restore：原始照片所在的資料夾（讀它的改名紀錄），可指定多次')
@@ -2547,6 +2510,20 @@ def run_cli(argv):
         if out and not os.path.isdir(os.path.dirname(os.path.abspath(out))):
             print('無法存檔，資料夾不存在：%s' % os.path.dirname(os.path.abspath(out)))
             sys.exit(2)
+    if a.undo:
+        log = latest_log(a.folder)
+        if not log:
+            print('這個資料夾沒有可復原的紀錄')
+            sys.exit(1)
+        try:
+            n, errors = undo_log(log)
+        except Exception as e:
+            print('無法復原：%s' % e)
+            sys.exit(1)
+        print('已依照 %s 復原 %d 個檔案%s' % (os.path.basename(log), n, '，%d 個沒有復原' % len(errors) if errors else ''))
+        for path, err in errors[:20]:
+            print('  [沒有復原] %s：%s' % (os.path.basename(path), err))
+        return
     if a.restore:
         plan, by_log = plan_restore(a.folder, a.log_folder, a.recursive)
         print('找到 %d 個要還原的檔名（%d 個依改名紀錄，%d 個依前綴規則）' % (len(plan), by_log, len(plan) - by_log))
@@ -2575,9 +2552,9 @@ def run_cli(argv):
         if r.get('error'):
             print('[錯誤] %s：%s' % (r['source'], r['error']))
         else:
-            print('%-40s %s S%02d%s %-3s 清晰:%3d %-3s %s 臉:%d 膚色:%s(%d%%) 整體:%s%s(%d%%) 爆點:%d%% %s' % (
+            print('%-40s %s S%02d%s %-3s 清晰:%3d %s 人數:%d 膚色:%s(%d%%) 整體:%s%s(%d%%) 爆點:%d%% %s' % (
                 r['source'], r['time'].strftime('%H:%M:%S') + ('' if r['time_src'] == 'EXIF' else '*'),
-                r['scene'], '★' if r['rep'] else ' ', '*' * r['stars'], r['sharp_score'], r.get('person') or '-',
+                r['scene'], '★' if r['rep'] else ' ', '*' * r['stars'], r['sharp_score'],
                 r.get('bright') or '-', r['faces'], label(r['skin']), r['skin_ratio'] * 100, label(r['main']),
                 '?' if r['uncertain'] else '', r['main_ratio'] * 100, r.get('highlight', 0) * 100, wb_text(r)))
     if a.report:
@@ -2588,13 +2565,13 @@ def run_cli(argv):
                 fp.write(text)
             print('已存分析報告：%s' % a.report)
     if a.csv:
-        export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output, a.time_seq)
+        export_csv(rows, a.csv, a.mode, a.order, not a.no_digits, a.output, a.time_seq, label_mode=a.label)
         print('已匯出 CSV：%s' % a.csv)
     if a.output == 'xmp':
-        plan, skipped = plan_xmp(rows)
+        plan, skipped = plan_xmp(rows, label_mode=a.label, label_names=a.label_names.split(','))
         by_source = {r['source']: r for r in rows if not r.get('error')}
         for p in plan:
-            print('  %s -> %s：%s' % (p['source'], os.path.basename(p['xmp']), xmp_summary(by_source[p['source']])))
+            print('  %s -> %s：%s' % (p['source'], os.path.basename(p['xmp']), xmp_summary(by_source[p['source']], label_mode=a.label)))
         if skipped:
             print('不寫入 %d 張：%s' % (len(skipped), XMP_SKIP_REASON))
         if a.apply:
