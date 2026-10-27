@@ -12,7 +12,7 @@
 
 ## 下載
 
-### [⬇ 下載 PhotoColorSorter-Windows.zip（約 60 MB）](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
+### [⬇ 下載 PhotoColorSorter-Windows.zip（約 70 MB）](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
 
 下載後在 ZIP 上按右鍵 →「解壓縮全部」，再執行資料夾裡的 `PhotoColorSorter.exe`。
 

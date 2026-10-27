@@ -1,0 +1,91 @@
+# 推送 v* 標籤時，在 Windows 上打包 exe、實際跑一次、壓成 ZIP 並發布到 Releases
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要發布的版本標籤（例如 v1.4.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 檢查版本號和標籤一致
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path photo_color_sorter.py -Pattern "__version__ = '(.+)'").Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:TAG) { throw "程式版本 v$v 和標籤 $env:TAG 不一致" }
+
+      - name: 用微軟正黑體重新產生使用教學 PDF（頁數不對就保留原本的）
+        shell: pwsh
+        run: |
+          python -m pip install -q reportlab pypdf
+          Copy-Item docs\使用教學.pdf $env:RUNNER_TEMP\tutorial_backup.pdf
+          python docs\build_tutorial.py
+          $pages = python -c "import pypdf; print(len(pypdf.PdfReader('docs/使用教學.pdf').pages))"
+          if ($LASTEXITCODE -ne 0 -or $pages -ne '4') {
+            Write-Host "產生的 PDF 有 $pages 頁，改用原本的版本"
+            Copy-Item $env:RUNNER_TEMP\tutorial_backup.pdf docs\使用教學.pdf -Force
+          }
+        continue-on-error: true
+
+      - name: 打包 exe（含自動測試）
+        shell: cmd
+        run: build_exe.bat
+
+      - name: 實際執行打包好的 exe
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'smoke'
+          New-Item -ItemType Directory -Force $d | Out-Null
+          .venv\Scripts\python.exe -c "import numpy as np, cv2, sys; img = np.zeros((300, 400, 3), np.uint8); img[:] = (255, 0, 0); cv2.imwrite(sys.argv[1] + '/blue.jpg', img)" $d
+          $p = Start-Process -FilePath dist\PhotoColorSorter\PhotoColorSorter.exe -ArgumentList "`"$d`"", '--preview', '--csv', "`"$d\out.csv`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "exe 結束代碼 $($p.ExitCode)" }
+          $csv = Get-Content "$d\out.csv" -Encoding UTF8
+          Write-Host ($csv -join "`n")
+          if (-not ($csv -match 'blue\.jpg')) { throw 'exe 沒有產生正確的 CSV' }
+
+      - name: 壓縮成 ZIP 並計算 SHA-256
+        id: zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\PhotoColorSorter -DestinationPath PhotoColorSorter-Windows.zip -Force
+          $h = (Get-FileHash PhotoColorSorter-Windows.zip -Algorithm SHA256).Hash.ToLower()
+          $mb = [math]::Round((Get-Item PhotoColorSorter-Windows.zip).Length / 1MB)
+          $notes = "docs\release-notes\$env:TAG.md"
+          if (-not (Test-Path $notes)) { throw "找不到發布說明 $notes" }
+          $body = (Get-Content $notes -Raw -Encoding UTF8).Replace('{SHA256}', $h).Replace('{SIZE_MB}', "$mb")
+          Set-Content -Path release-notes.md -Value $body -Encoding UTF8
+          Write-Host "SHA-256: $h  大小: $mb MB"
+
+      - name: 發布到 Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $title = "$env:TAG 舞台照片色彩分類工具"
+          gh release view $env:TAG 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG PhotoColorSorter-Windows.zip --clobber
+            gh release edit $env:TAG --title $title --notes-file release-notes.md
+          } else {
+            gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --latest
+          }

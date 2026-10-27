@@ -12,7 +12,7 @@ This tool looks at every photo for you: **what color of light is falling on the 
 
 ## Download
 
-### [⬇ Download PhotoColorSorter-Windows.zip (about 60 MB)](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
+### [⬇ Download PhotoColorSorter-Windows.zip (about 70 MB)](https://github.com/ting2303/photo-color-sorter/releases/latest/download/PhotoColorSorter-Windows.zip)
 
 Right-click the ZIP → **Extract All**, then run `PhotoColorSorter.exe` inside the folder.
 
