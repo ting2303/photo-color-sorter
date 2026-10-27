@@ -71,6 +71,24 @@ In the Library module press `G` for Grid view, then set **Sort** in the toolbar 
 
 To work on one lighting look at a time, use **Library Filter → Text → Filename** and type e.g. `6藍`.
 
+## Picking helpers
+
+After analysis the table shows a few extra columns to help you decide what to edit first. They only appear in the table; filenames and the result of "② 執行" are unchanged.
+
+| Column | Meaning |
+|---|---|
+| 拍攝時間 (capture time) | Read from EXIF; falls back to the file time, marked with `*` |
+| 段落 (scene) | Sections split by time and lighting (S01, S02…): a pause over 60 s or a light change starts a new one |
+| 代表 (pick) | ★ marks the best photo to edit first in each scene (sharp, large face, good exposure). Edit it, then sync to the scene |
+| 清晰度 (sharpness) | Relative score 0–100 within the batch |
+| `?` after 整體 | Low vote share for the overall color; the frame is mixed, check it yourself |
+
+New options:
+
+- **整體偏重演出者 (weight the performer)**: tick it when the LED wall behind is very colorful, so the light around the performer counts more
+- **表格排序 (table order)**: by capture time, filename or color
+- **匯出 CSV (export CSV)**: saves the table into the photo folder; opens in Excel
+
 ## How it works
 
 - **Face detection** uses OpenCV's [YuNet](https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet) model. It doesn't rely on color, so stage lighting doesn't throw it off, and it finds small faces in wide shots. It only finds *where* faces are — it does not identify anyone.
