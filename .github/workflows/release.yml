@@ -1,14 +1,13 @@
-# 推送 v* 標籤時，在 Windows 上打包 exe、實際跑一次、壓成 ZIP 並發布到 Releases
+# 在 Windows 上打包 exe、實際跑一次、壓成 ZIP。
+# 合併到 main 時，如果程式裡的版本號（__version__）還沒有發布過，就自動建立 v版本號 的 Release；
+# 其他分支只打包和測試，ZIP 放在這次執行的 Artifacts 裡，可以下載先試用。
 name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: ['main', 'feature/**']
+    paths: ['photo_color_sorter.py', 'build_exe.bat', 'requirements.txt', 'docs/**', '.github/workflows/release.yml']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: '要發布的版本標籤（例如 v1.4.0）'
-        required: true
 
 permissions:
   contents: write
@@ -17,23 +16,27 @@ jobs:
   windows:
     runs-on: windows-latest
     env:
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
       PYTHONUTF8: '1'
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TAG }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: 檢查版本號和標籤一致
+      - name: 讀取版本號，決定要不要發布
         shell: pwsh
         run: |
           $v = (Select-String -Path photo_color_sorter.py -Pattern "__version__ = '(.+)'").Matches[0].Groups[1].Value
-          $base = ($env:TAG -split '-')[0]  # v1.4.0-rc1 這類測試版只比對前面的版本號
-          if ("v$v" -ne $base) { throw "程式版本 v$v 和標籤 $env:TAG 不一致" }
+          "TAG=v$v" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          gh release view "v$v" --repo $env:GITHUB_REPOSITORY *> $null
+          $exists = ($LASTEXITCODE -eq 0)
+          $publish = ($env:GITHUB_REF -eq 'refs/heads/main') -and -not $exists
+          "PUBLISH=$publish" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          Write-Host "版本 v$v；已經發布過：$exists；這次發布：$publish"
+          if (-not (Test-Path "docs\release-notes\v$v.md")) { throw "找不到發布說明 docs\release-notes\v$v.md" }
+          exit 0
 
       - name: 用微軟正黑體重新產生使用教學 PDF（頁數不對就保留原本的）
         shell: pwsh
@@ -71,26 +74,22 @@ jobs:
           Compress-Archive -Path dist\PhotoColorSorter -DestinationPath PhotoColorSorter-Windows.zip -Force
           $h = (Get-FileHash PhotoColorSorter-Windows.zip -Algorithm SHA256).Hash.ToLower()
           $mb = [math]::Round((Get-Item PhotoColorSorter-Windows.zip).Length / 1MB)
-          $notes = "docs\release-notes\$(($env:TAG -split '-')[0]).md"
-          if (-not (Test-Path $notes)) { throw "找不到發布說明 $notes" }
+          $notes = "docs\release-notes\$env:TAG.md"
           $body = (Get-Content $notes -Raw -Encoding UTF8).Replace('{SHA256}', $h).Replace('{SIZE_MB}', "$mb")
           Set-Content -Path release-notes.md -Value $body -Encoding UTF8
           Write-Host "SHA-256: $h  大小: $mb MB"
 
-      - name: 發布到 Releases
+      - name: 保存 ZIP（這次執行的 Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoColorSorter-Windows-${{ env.TAG }}
+          path: |
+            PhotoColorSorter-Windows.zip
+            release-notes.md
+
+      - name: 發布到 Releases（只在 main 而且這個版本還沒發布過）
+        if: env.PUBLISH == 'True'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $title = "$env:TAG 舞台照片色彩分類工具"
-          gh release view $env:TAG 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG PhotoColorSorter-Windows.zip --clobber
-            gh release edit $env:TAG --title $title --notes-file release-notes.md
-          } else {
-            if ($env:TAG.Contains('-')) {  # 測試版：標成預先發行，不會變成「最新版本」
-              gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --prerelease
-            } else {
-              gh release create $env:TAG PhotoColorSorter-Windows.zip --title $title --notes-file release-notes.md --latest
-            }
-          }
+          gh release create $env:TAG PhotoColorSorter-Windows.zip --target $env:GITHUB_SHA `
+            --title "$env:TAG 舞台照片色彩分類工具" --notes-file release-notes.md --latest
