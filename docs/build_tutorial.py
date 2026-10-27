@@ -128,7 +128,7 @@ def build(out):
            box('<b>注意：請在匯入 Lightroom 之前使用，並先備份原始照片。</b>已匯入的照片在外部改名，Lightroom 會找不到檔案。', WARN_BG, WARN),
            Spacer(1, 10),
            step('1', '下載並開啟',
-                '到 GitHub 專案的 <b>Releases</b> 下載 <b>PhotoColorSorter-Windows.zip</b>（約 60 MB），'
+                '到 GitHub 專案的 <b>Releases</b> 下載 <b>PhotoColorSorter-Windows.zip</b>（約 70 MB），'
                 '右鍵「解壓縮全部」後雙擊 <b>PhotoColorSorter.exe</b>。<br/>'
                 '<font color="#59636e">出現「Windows 已保護您的電腦」→ 點「其他資訊」→「仍要執行」。</font>'),
            Spacer(1, 6),
