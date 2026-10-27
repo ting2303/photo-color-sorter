@@ -1558,7 +1558,7 @@ def run_gui(initial_folder=None):
 
     frame = ttk.Frame(root)
     frame.pack(fill='both', expand=True, padx=8)
-    tree = ttk.Treeview(frame, columns=cols, show='tree headings', displaycolumns=basic_cols)
+    tree = ttk.Treeview(frame, columns=cols, show='tree headings', displaycolumns=basic_cols, height=8)
     tree.heading('#0', text='')
     tree.column('#0', width=70, stretch=False, anchor='w')
     for c, hd, w in zip(cols, heads, widths):
@@ -1646,7 +1646,8 @@ def run_gui(initial_folder=None):
     tl.bind('<Button-1>', on_timeline_click)
     tl.bind('<Configure>', lambda e: draw_timeline())
 
-    ttk.Label(root, textvariable=status, padding=8).pack(fill='x')
+    # 狀態列先排在最下面：視窗太矮時，被壓縮的是表格，不是狀態列
+    ttk.Label(root, textvariable=status, padding=8).pack(side='bottom', fill='x', before=frame)
 
     def set_busy(b):
         state['busy'] = b

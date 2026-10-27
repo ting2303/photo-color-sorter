@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""產生 docs/使用教學.pdf（需要 Windows 內建的微軟正黑體與 reportlab：pip install reportlab）"""
+"""產生 docs/使用教學.pdf（需要 reportlab：pip install reportlab）。
+字型預設用 Windows 內建的微軟正黑體；其他系統可用環境變數 PCS_FONT、PCS_FONT_BOLD 指定 TrueType 字型檔"""
 import os
 import sys
 
@@ -16,8 +17,10 @@ sys.path.insert(0, os.path.dirname(HERE))
 from photo_color_sorter import __version__  # noqa: E402
 
 FONT_DIR = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')
-pdfmetrics.registerFont(TTFont('JH', os.path.join(FONT_DIR, 'msjh.ttc'), subfontIndex=0))
-pdfmetrics.registerFont(TTFont('JHB', os.path.join(FONT_DIR, 'msjhbd.ttc'), subfontIndex=0))
+pdfmetrics.registerFont(TTFont('JH', os.environ.get('PCS_FONT') or os.path.join(FONT_DIR, 'msjh.ttc'), subfontIndex=0))
+pdfmetrics.registerFont(TTFont('JHB', os.environ.get('PCS_FONT_BOLD') or os.path.join(FONT_DIR, 'msjhbd.ttc'), subfontIndex=0))
+pdfmetrics.registerFontFamily('JH', normal='JH', bold='JHB', italic='JH', boldItalic='JHB')  # 讓 <b> 用粗體字型
+TOTAL_PAGES = 4
 
 INK, MUTED, LINE = colors.HexColor('#1f2328'), colors.HexColor('#59636e'), colors.HexColor('#d8dee4')
 ACCENT, SOFT = colors.HexColor('#3b5bdb'), colors.HexColor('#f3f5fa')
@@ -99,7 +102,7 @@ def footer(canvas, doc):
     canvas.setFont('JH', 8.5)
     canvas.setFillColor(MUTED)
     canvas.drawString(18 * mm, 11 * mm, 'github.com/ting2303/photo-color-sorter')
-    canvas.drawRightString(192 * mm, 11 * mm, '%d / 3' % doc.page)
+    canvas.drawRightString(192 * mm, 11 * mm, '%d / %d' % (doc.page, TOTAL_PAGES))
     canvas.restoreState()
 
 
@@ -135,37 +138,71 @@ def build(out):
            Spacer(1, 6),
            step('3', '確認後按「② 執行」',
                 '完成！不滿意可按「<b>復原上一次</b>」，所有檔案會恢復原樣。'),
-           Spacer(1, 10), image('screenshot-rename.png', 150),
-           Spacer(1, 8),
-           grid([[P('<b>輸出方式</b>'), P('改檔名　或　分資料夾')],
-                 [P('<b>依據</b>'), P('膚色＋整體／只看膚色／只看整體')],
-                 [P('<b>優先</b>'), P('膚色或整體放前面（排序先看哪一項）')],
-                 [P('<b>加排序數字</b>'), P('不勾選檔名更短，例如 粉藍_')]],
-                [34, 140], [('BACKGROUND', (0, 0), (0, -1), SOFT), ('GRID', (0, 0), (-1, -1), 0.5, LINE)], pad=5),
+           Spacer(1, 8), image('screenshot-rename.png', 128),
+           P('表格依燈光段落分組，每段的標題列寫著張數、主色和「★ 先修」哪一張；上方色帶是整場的燈光時間軸，點一下就跳到那一段。', 'small'),
+           Spacer(1, 6),
+           grid([[P('<b>分類依據</b>'), P('膚色＋整體／只看膚色／只看整體')],
+                 [P('<b>同色內依拍攝時間排列</b>'), P('檔名多一段時間序號（例如 8粉_<b>0012</b>_DSC02921），同一個顏色裡照拍攝時間排')],
+                 [P('<b>進階設定</b>'), P('輸出方式、優先、加排序數字、舞台顏色、燈光段落、挑圖功能（第 3 頁）。設定會自動記住')]],
+                [44, 130], [('BACKGROUND', (0, 0), (0, -1), SOFT), ('GRID', (0, 0), (-1, -1), 0.5, LINE)], pad=5),
            PageBreak()]
 
-    # ---- 第 3 頁：Lightroom、問答、安全與免責
-    st += [P('在 Lightroom 依顏色排列', 'h1'),
-           P('圖庫模組 → 格線檢視（<b>G</b>）→ 下方工具列「排序方式」選 <b>檔案名稱</b>。'),
-           P('想只看某種光？「圖庫過濾器 → 文字 → 檔案名稱」輸入例如 <b>6藍</b>，調好一張再同步到同組照片。'),
+    # ---- 第 3 頁：挑圖輔助與進階設定
+    st += [P('挑圖輔助：先修哪一張', 'h1'),
+           P('分析完成後，表格會幫你標出每段該先修的照片。這些資訊只顯示在表格與匯出的 CSV，<b>不會寫進檔名</b>。'),
            Spacer(1, 6),
+           qa([('段落', '照拍攝時間切開的同燈光區段（S01、S02…）。停頓超過 60 秒或燈光換色就換段。'),
+               ('代表 ★', '每段最適合先修的一張（清楚、臉大、亮度適中）。修好它，再同步給整段。'),
+               ('星等', '整批相對的初篩：1 星 = 沒有臉、臉太暗或可能模糊；3 星 = 清楚、臉夠大、曝光正常。'),
+               ('人物', '同一人歸同一組（P1 照片最多）。只比對臉像不像，不辨識是誰。'),
+               ('亮度', '亮／中／暗：和同一人最亮的照片比，追光忽亮忽暗時可以分開同步。'),
+               ('調色起點', '臉的色偏方向，例如「色溫+20 色調-12」。只是建議，不會寫入檔案。'),
+               ('小方塊', '每列最左邊：左半是膚色、右半是整體主色。「顯示 → 顯示所有欄位」可以看清晰度、爆點等細節。')],
+              (30, 144)),
+           Spacer(1, 4),
+           P('進階設定', 'h1'),
+           image('screenshot-advanced.png', 120),
+           Spacer(1, 4),
+           qa([('舞台顏色', '整場燈光很淡、大部分被判成白時，改成「淡色舞台」再分析一次比較。真正的白光場景會因此被判成有色，請和「標準」對照。'),
+               ('燈光段落', '自動判斷之外，可以輸入檔名號碼（例如 <b>2921, 3040</b>）從那幾張開始新段落。'),
+               ('挑圖功能', '代表張、星等、人物分組、亮度分組、調色起點、燈光時間軸都可以關掉；關掉人物分組分析會快很多。'),
+               ('偏重演出者', '背景 LED 螢幕很花時勾選，演出者周圍的顏色比背景更重要。')],
+              (30, 144)),
+           PageBreak()]
+
+    # ---- 第 4 頁：分析報告、還原檔名、Lightroom、問答、安全與免責
+    st += [P('分析報告與修圖後還原檔名', 'h1'),
+           grid([[image('screenshot-report.png', 54),
+                  [P('<b>分析報告</b>（按「分析報告」）'),
+                   P('整批的統計，以及這次結果需要注意的地方和建議的調整方式。'
+                     '提醒依輕重分色：<font color="#9a4f00"><b>橘色</b>需要注意</font>、<font color="#1d4a8a"><b>藍色</b>參考</font>、'
+                     '<font color="#17663a"><b>綠色</b>正常</font>。'),
+                   Spacer(1, 6),
+                   P('<b>修圖後還原檔名</b>（選單「工具」）'),
+                   P('輸出的 JPG 會帶著顏色前綴，選輸出資料夾執行後就會改回來：<br/>'
+                     '8粉_0012_DSC02921-Enhanced-NR.jpg<br/>→ <b>DSC02921-Enhanced-NR.jpg</b><br/>'
+                     '修圖軟體加的字照樣保留，依檔名排序就回到拍攝順序。')]]],
+                [58, 116], [('VALIGN', (0, 0), (-1, -1), 'TOP'), ('LEFTPADDING', (0, 0), (0, 0), 0)], pad=3),
+           P('在 Lightroom 依顏色排列', 'h1'),
+           P('圖庫模組 → 格線檢視（<b>G</b>）→ 下方工具列「排序方式」選 <b>檔案名稱</b>。'
+             '想只看某種光？「圖庫過濾器 → 文字 → 檔案名稱」輸入例如 <b>6藍</b>，調好一張再同步到同組照片。'),
            P('常見問題', 'h1'),
            qa([('判斷錯了？', '自動判斷可能有誤（例如背景圖案被當成臉）。可手動改名，或按「復原上一次」換個選項再試。'),
+               ('大部分都是「白」？', '燈光很淡的舞台常見。可以改「只看膚色」，或在進階設定試「淡色舞台」。'),
                ('很多照片是「無」？', '沒偵測到臉：背對、臉太小或太暗。它們會排在最後，方便另外處理。'),
                ('會弄壞照片嗎？', '不會。只改名或搬移，不修改內容、不刪檔，也只動所選資料夾內的照片。'),
                ('照片會上傳嗎？', '不會。全部在你的電腦離線處理；只找「哪裡有臉」，不辨識是誰。'),
-               ('網路磁碟很慢？', '先把照片複製到本機硬碟再分析會快很多。')]),
-           Spacer(1, 6),
+               ('網路磁碟很慢？', '先複製到本機硬碟再分析會快很多。')], (40, 134)),
+           Spacer(1, 4),
            P('授權與免責聲明', 'h1'),
            qa([('授權', 'PolyForm Noncommercial 1.0.0，© 2026 ting2303。<b>個人與非營利使用免費，禁止販售或用於商業產品、服務。</b>'
                        '商業授權請聯絡作者。'),
                ('免責', '本工具依現狀提供，不提供任何擔保。因使用造成的檔案遺失、錯亂或其他損失，作者概不負責。'
                        '照片人物的肖像權與個資保護由使用者自行負責。'),
                ('商標', 'Adobe、Lightroom 為 Adobe Inc. 的商標，本工具與 Adobe 無關。'),
-               ('完整條款', '請見 LICENSE、DISCLAIMER.md、THIRD_PARTY_NOTICES.md。')], (28, 146)),
-           Spacer(1, 10),
-           box('驗證下載檔（選用）：PowerShell 執行 <b>Get-FileHash .\\PhotoColorSorter-Windows.zip</b>，'
-               '結果與 Release 頁面公布的 SHA-256 相同，就代表檔案沒被竄改。'),
+               ('完整條款', '請見 LICENSE、DISCLAIMER.md、THIRD_PARTY_NOTICES.md。'),
+               ('驗證下載', '（選用）PowerShell 執行 <b>Get-FileHash .\\PhotoColorSorter-Windows.zip</b>，'
+                        '結果與 Release 頁面公布的 SHA-256 相同，就代表檔案沒被竄改。')], (28, 146)),
            ]
 
     doc = SimpleDocTemplate(out, pagesize=A4, leftMargin=18 * mm, rightMargin=18 * mm, topMargin=16 * mm, bottomMargin=18 * mm,
