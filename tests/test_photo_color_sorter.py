@@ -285,3 +285,40 @@ class PickingTests(unittest.TestCase):
         self.assertEqual(data[1][0], 'IMG_1.jpg')
         self.assertEqual(data[1][3], 'S01')
         self.assertTrue(data[1][14].startswith('無6藍_'))
+
+
+class StabilityTests(unittest.TestCase):
+    """穩定度測試找到的問題"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_elongated_image(self):
+        for shape in ((1, 401, 3), (10000, 10, 3), (10, 10000, 3)):
+            key, _, _ = pcs.analyze_overall(np.zeros(shape, np.uint8))
+            self.assertEqual(pcs.label(key), '暗')
+        self.assertEqual(pcs.resize_max(np.zeros((1, 2000, 3), np.uint8), 400).shape[:2], (1, 400))
+
+    def test_hidden_files_ignored(self):
+        save(os.path.join(self.dir, 'A.jpg'), solid((255, 0, 0)))
+        save(os.path.join(self.dir, '.hidden.jpg'), solid((255, 0, 0)))
+        save(os.path.join(self.dir, '._A.jpg'), solid((255, 0, 0)))
+        self.assertEqual([g['source'] for g in pcs.collect_groups(self.dir)], ['A.jpg'])
+        self.assertEqual([g['source'] for g in pcs.collect_groups(self.dir, recursive=True)], ['A.jpg'])
+
+    def test_repeated_apply_undo_keeps_all_logs(self):
+        """改名→復原→改名→復原 在同一秒內完成時，兩份紀錄都要留下，檔案完全復原"""
+        save(os.path.join(self.dir, 'A.jpg'), solid((255, 0, 0)))
+        for _ in range(2):
+            res = [pcs.analyze_group(g) for g in pcs.collect_groups(self.dir)]
+            done, errors, log = pcs.apply_renames(pcs.plan_renames(res), self.dir)
+            self.assertEqual((len(done), errors), (1, []))
+            self.assertEqual(pcs.latest_log(self.dir), log)
+            pcs.undo_log(log)
+        names = sorted(os.listdir(self.dir))
+        self.assertIn('A.jpg', names)
+        self.assertEqual(len([n for n in names if '已復原' in n]), 2)
+        self.assertIsNone(pcs.latest_log(self.dir))

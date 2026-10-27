@@ -140,7 +140,7 @@ def resize_max(img, max_side):
     s = max_side / max(h, w)
     if s >= 1:
         return img
-    return cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+    return cv2.resize(img, (max(1, int(w * s)), max(1, int(h * s))), interpolation=cv2.INTER_AREA)
 
 
 def to_hsv(img):
@@ -340,13 +340,14 @@ def is_inside(path, base):
 
 
 def walk_photos(folder, recursive=False):
-    """逐一列出 (資料夾, [檔名])；遞迴時略過本工具建立的顏色資料夾，避免重複分類"""
+    """逐一列出 (資料夾, [檔名])；遞迴時略過本工具建立的顏色資料夾，避免重複分類。
+    以「.」開頭的隱藏檔（含 macOS 的 ._ 附屬檔）與隱藏資料夾一律略過。"""
     if not recursive:
-        yield folder, os.listdir(folder)
+        yield folder, [n for n in os.listdir(folder) if not n.startswith('.')]
         return
     for d, dirs, names in os.walk(folder):
-        dirs[:] = [x for x in dirs if not FOLDER_RE.match(x)]
-        yield d, names
+        dirs[:] = [x for x in dirs if not FOLDER_RE.match(x) and not x.startswith('.')]
+        yield d, [n for n in names if not n.startswith('.')]
 
 
 def collect_groups(folder, recursive=False):
@@ -583,8 +584,10 @@ def batch_features(results, mode='both', order='skin', performer=False):
                         sharp_score=int(round(100 * ranks[i] / max(len(ok) - 1, 1))) if len(ok) > 1 else 100,
                         uncertain=r['main_ratio'] < UNCERTAIN_RATIO, rep=False))
     # 每段代表張：清晰度 50% + 臉的大小 25% + 臉部亮度接近中間 25%；有臉的照片優先
-    for s in {r['scene'] for r in out}:
-        members = [r for r in out if r['scene'] == s]
+    by_scene = {}
+    for r in out:
+        by_scene.setdefault(r['scene'], []).append(r)
+    for members in by_scene.values():
         with_face = [r for r in members if r['faces']] or members
         big = max(r['face_px'] for r in with_face) or 1.0
 
@@ -668,7 +671,7 @@ def apply_renames(plan, log_dir):
     stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     log_path = os.path.join(log_dir, LOG_PREFIX + '%s.csv' % stamp)
     n = 1
-    while os.path.exists(log_path):
+    while os.path.exists(log_path) or os.path.exists(log_path[:-4] + '_已復原.csv'):  # 同一秒內再執行也不撞名
         n += 1
         log_path = os.path.join(log_dir, LOG_PREFIX + '%s_%d.csv' % (stamp, n))
     done, errors = [], []
@@ -699,9 +702,16 @@ def apply_renames(plan, log_dir):
 
 
 def latest_log(folder):
-    logs = sorted(f for f in os.listdir(folder)
-                  if f.startswith((LOG_PREFIX, '_色彩改名紀錄_')) and f.endswith('.csv') and '已復原' not in f)
-    return os.path.join(folder, logs[-1]) if logs else None
+    logs = [f for f in os.listdir(folder)
+            if f.startswith((LOG_PREFIX, '_色彩改名紀錄_')) and f.endswith('.csv') and '已復原' not in f]
+    if not logs:
+        return None
+
+    def order(f):  # 最新的排最後：依修改時間，同時間再依檔名裡的序號（_2、_10…）
+        m = re.search(r'_(\d+)_(\d+)(?:_(\d+))?\.csv$', f)
+        seq = (m.group(1), m.group(2), int(m.group(3) or 1)) if m else ('', '', 0)
+        return (os.path.getmtime(os.path.join(folder, f)), seq)
+    return os.path.join(folder, max(logs, key=order))
 
 
 def undo_log(log_path):
@@ -727,7 +737,11 @@ def undo_log(log_path):
         while is_inside(d, base) and FOLDER_RE.match(os.path.basename(d)) and os.path.isdir(d) and not os.listdir(d):
             os.rmdir(d)
             d = os.path.dirname(d)
-    os.rename(log_path, log_path[:-4] + '_已復原.csv')
+    done_path, k = log_path[:-4] + '_已復原.csv', 1
+    while os.path.exists(done_path):  # 不覆蓋舊的已復原紀錄
+        k += 1
+        done_path = log_path[:-4] + '_已復原_%d.csv' % k
+    os.rename(log_path, done_path)
     return done, errors
 
 
@@ -1005,7 +1019,11 @@ def run_gui(initial_folder=None):
         if not state['results']:
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
-        path = os.path.join(f, '_色彩分析_%s.csv' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+        stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        path, k = os.path.join(f, '_色彩分析_%s.csv' % stamp), 1
+        while os.path.exists(path):  # 同一秒內重複匯出不覆蓋
+            k += 1
+            path = os.path.join(f, '_色彩分析_%s_%d.csv' % (stamp, k))
         try:
             rows, _ = current_rows()
             export_csv(rows, path, mode.get(), order.get(), digits.get(), output.get())
@@ -1052,6 +1070,9 @@ def run_cli(argv):
     ap.add_argument('--csv', metavar='PATH', help='把分析結果（含挑圖資訊）存成 CSV')
     a = ap.parse_args(argv)
 
+    if not os.path.isdir(a.folder):
+        print('找不到資料夾：%s' % a.folder)
+        sys.exit(2)
     groups = collect_groups(a.folder, a.recursive)
     print('共 %d 張，分析中…' % len(groups))
     results = run_analysis(groups, progress=lambda i, n: print('\r%d/%d' % (i, n), end='', flush=True))
