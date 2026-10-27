@@ -825,7 +825,7 @@ def _assign_brightness(rows):
     差 0.5 級以內為亮、1.5 級以內為中、更暗為暗。舞台上同一首歌追光忽亮忽暗時，可以分開同步。"""
     def ref_of(vals):
         return float(np.percentile(vals, 90)) if vals else None
-    lin = {i: _linear(r['face_bright']) for i, r in enumerate(rows) if r.get('face_bright')}
+    lin = {i: _linear(r['face_bright']) for i, r in enumerate(rows) if r.get('face_bright') is not None}
     all_ref = ref_of(list(lin.values()))
     by_person = {}
     for i, r in enumerate(rows):
@@ -1294,9 +1294,12 @@ def run_gui(initial_folder=None):
 
     # 記住上次的設定（存在使用者資料夾的 .photo_color_sorter.json）
     saved = load_settings()
+    allowed = {'output': ('rename', 'folder'), 'mode': ('both', 'skin', 'main'), 'order': ('skin', 'main'),
+               'sort_by': ('time', 'name', 'color', 'person', 'stars'), 'stage': tuple(STAGE_PRESETS),
+               'scene_mode': ('auto', 'manual', 'both')}
     for var, k in ((output, 'output'), (mode, 'mode'), (order, 'order'), (sort_by, 'sort_by'),
                    (stage, 'stage'), (scene_mode, 'scene_mode')):
-        if isinstance(saved.get(k), str):
+        if saved.get(k) in allowed[k]:  # 設定檔被改壞時忽略，不讓程式當掉
             var.set(saved[k])
     for var, k in ((digits, 'digits'), (performer, 'performer'), (time_seq, 'time_seq'), (show_all, 'show_all'),
                    (adv_open, 'adv_open'), (group_scene, 'group_scene')):
@@ -1305,8 +1308,6 @@ def run_gui(initial_folder=None):
     for k, v in (saved.get('features') or {}).items():
         if k in feat and isinstance(v, bool):
             feat[k].set(v)
-    if stage.get() not in STAGE_PRESETS:
-        stage.set('standard')
 
     def features_now():
         return {k: v.get() for k, v in feat.items()}
@@ -1318,6 +1319,11 @@ def run_gui(initial_folder=None):
                        'adv_open': adv_open.get(), 'group_scene': group_scene.get(), 'features': features_now()})
 
     def on_option():
+        # 關掉的功能不能拿來排序（看不到欄位卻照它排會很混亂），改回照拍攝時間
+        for k, rb in sort_radios.items():
+            rb.state(['!disabled'] if feat[k].get() else ['disabled'])
+            if sort_by.get() == k and not feat[k].get():
+                sort_by.set('time')
         apply_columns()
         refresh_table()
         remember()
@@ -1404,8 +1410,12 @@ def run_gui(initial_folder=None):
     for v in ('standard', 'pale'):
         ttk.Radiobutton(a2, text=STAGE_NAMES[v], value=v, variable=stage, command=on_stage).pack(side='left')
     ttk.Label(a2, text='　表格排序：').pack(side='left')
+    sort_radios = {}
     for t, v in (('拍攝時間', 'time'), ('檔名', 'name'), ('顏色', 'color'), ('人物', 'person'), ('星等', 'stars')):
-        ttk.Radiobutton(a2, text=t, value=v, variable=sort_by, command=on_option).pack(side='left')
+        rb = ttk.Radiobutton(a2, text=t, value=v, variable=sort_by, command=on_option)
+        rb.pack(side='left')
+        if v in feat:
+            sort_radios[v] = rb
     ttk.Checkbutton(a2, text='依段落分組（照拍攝時間排序時）', variable=group_scene,
                     command=on_option).pack(side='left', padx=10)
     a3 = ttk.Frame(adv)
@@ -1640,7 +1650,7 @@ def run_gui(initial_folder=None):
                                          values=[vals[c] for c in cols], tags=('scenehdr',))
         for r in rows:
             if r.get('error'):
-                tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', ''),
+                tree.insert('', 'end', text='⚠', values=(r['source'],) + ('',) * 9 + ('錯誤', '', '', '', r['error'], '', '讀取失敗：' + r['error']),
                             tags=('err',))
                 continue
             clean = strip_prefix(r['source'])
@@ -1851,8 +1861,8 @@ def run_gui(initial_folder=None):
         if not state['results']:
             messagebox.showinfo('提示', '請先按「① 分析」')
             return
-        rows = [r for r in batch_features(state['results'], mode.get(), order.get(), performer.get())
-                if not r.get('error')]
+        # 和主畫面相同：套用手動分段，照拍攝時間排
+        rows = sorted([r for r in current_rows()[0] if not r.get('error')], key=lambda r: (r['time'], r['dir'], r['stem']))
         if not rows:
             return
         win = tk.Toplevel(root)
@@ -1876,7 +1886,7 @@ def run_gui(initial_folder=None):
             cv.create_rectangle(x0, 50, x1, 90, fill=TAG_COLORS[r['main']], outline='')
             cv.create_rectangle(x0, 110, x1, 150, fill=TAG_COLORS[r['skin']], outline='')
             cv.create_line(x0, 172, x0, 188, fill='#333')
-            if r['rep']:
+            if r['rep'] and feat['rep'].get():
                 cv.create_text(x0, 200, text='★', fill='#b8860b')
             if i and r['scene'] != rows[i - 1]['scene']:
                 cv.create_line(x0, 40, x0, 160, fill='#444', dash=(3, 3))
